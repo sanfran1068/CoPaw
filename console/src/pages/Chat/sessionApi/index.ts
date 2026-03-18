@@ -3,7 +3,7 @@ import {
   IAgentScopeRuntimeWebUISessionAPI,
   IAgentScopeRuntimeWebUIMessage,
 } from "@agentscope-ai/chat";
-import api, { type ChatSpec, type Message } from "../../../api";
+import api, { type ChatSpec, type ChatHistory, type Message } from "../../../api";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -195,6 +195,17 @@ const chatSpecToSession = (chat: ChatSpec): ExtendedSession =>
 /** Returns true when id is a pure numeric local timestamp (not a backend UUID). */
 const isLocalTimestamp = (id: string): boolean => /^\d+$/.test(id);
 
+/** Detect if backend is still generating content for this chat. */
+const isGenerating = (chatHistory: ChatHistory): boolean => {
+  if (chatHistory.status === "running") return true;
+  if (chatHistory.status === "completed" || chatHistory.status === "failed")
+    return false;
+  const msgs = chatHistory.messages || [];
+  if (msgs.length === 0) return false;
+  const last = msgs[msgs.length - 1];
+  return last.role === ROLE_USER;
+};
+
 /**
  * Resolve and persist the real backend UUID for a local timestamp session.
  * Stores the real UUID as realId while keeping the timestamp as id, so the
@@ -369,6 +380,7 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
           messages: convertMessages(chatHistory.messages || []),
           meta: fromList.meta || {},
           realId: fromList.realId,
+          generating: isGenerating(chatHistory),
         };
         this.updateWindowVariables(session);
         return session;
@@ -404,6 +416,7 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
           messages: convertMessages(chatHistory.messages || []),
           meta: refreshed.meta || {},
           realId: refreshed.realId,
+          generating: isGenerating(chatHistory),
         };
         this.updateWindowVariables(session);
         return session;
@@ -434,6 +447,7 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
       channel: fromList?.channel || DEFAULT_CHANNEL,
       messages: convertMessages(chatHistory.messages || []),
       meta: fromList?.meta || {},
+      generating: isGenerating(chatHistory),
     };
 
     this.updateWindowVariables(session);

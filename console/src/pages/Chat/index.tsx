@@ -12,6 +12,7 @@ import defaultConfig, { getDefaultConfig } from "./OptionsPanel/defaultConfig";
 import Weather from "./Weather";
 import { getApiToken, getApiUrl } from "../../api/config";
 import { providerApi } from "../../api/modules/provider";
+import { chatApi } from "../../api/modules/chat";
 import ModelSelector from "./ModelSelector";
 import "./index.module.less";
 
@@ -247,7 +248,35 @@ export default function ChatPage() {
         ...defaultConfig.api,
         fetch: customFetch,
         cancel(data: { session_id: string }) {
-          console.log(data);
+          const chatId = sessionApi.getRealIdForSession(data.session_id) ?? data.session_id;
+          if (chatId) {
+            chatApi.stopChat(chatId).catch((err) => {
+              console.error("Failed to stop chat:", err);
+            });
+          }
+        },
+        async reconnect(data: { session_id: string; signal?: AbortSignal }) {
+          const chatId =
+            sessionApi.getRealIdForSession(data.session_id) ??
+            data.session_id;
+
+          const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+          };
+          const token = getApiToken();
+          if (token) headers.Authorization = `Bearer ${token}`;
+
+          return fetch(getApiUrl("/console/chat"), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              reconnect: true,
+              session_id: chatId,
+              user_id: window.currentUserId || "default",
+              channel: window.currentChannel || "console",
+            }),
+            signal: data.signal,
+          });
         },
       },
       customToolRenderConfig: {

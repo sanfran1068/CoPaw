@@ -43,6 +43,11 @@ export const chatApi = {
         body: JSON.stringify(chatIds),
       },
     ),
+
+  stopChat: (chatId: string) =>
+    request<void>(`/console/chat/stop?chat_id=${encodeURIComponent(chatId)}`, {
+      method: "POST",
+    }),
 };
 
 export const sessionApi = {

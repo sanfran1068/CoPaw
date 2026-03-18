@@ -16,6 +16,7 @@ export interface Message {
 
 export interface ChatHistory {
   messages: Message[];
+  status?: string;
 }
 
 export interface ChatDeleteResponse {
