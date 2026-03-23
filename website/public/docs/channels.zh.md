@@ -13,6 +13,11 @@
 - **bot_prefix** — 机器人回复前缀（如 `[BOT]`），方便区分
 - **filter_tool_messages** — （可选，默认 `false`）过滤工具调用和输出消息，不发送给用户。设为 `true` 可隐藏工具执行详情。
 - **filter_thinking** — （可选，默认 `false`）过滤模型的思考/推理内容，不发送给用户。设为 `true` 可隐藏 thinking 内容。
+- **dm_policy** — （可选，默认 `"open"`）私聊访问策略。`"open"` 允许所有用户；`"allowlist"` 仅允许 `allow_from` 中的用户。
+- **group_policy** — （可选，默认 `"open"`）群聊访问策略。`"open"` 允许所有用户；`"allowlist"` 仅允许 `allow_from` 中的用户。
+- **allow_from** — （可选，默认 `[]`）允许与机器人交互的用户 ID 列表。仅当 `dm_policy` 或 `group_policy` 设为 `"allowlist"` 时生效。
+- **deny_message** — （可选，默认 `""`）被白名单拒绝的用户收到的自动回复消息。留空则不回复。
+- **require_mention** — （可选，默认 `false`）设为 `true` 时，机器人在群聊中仅响应被 @提及 的消息。白名单检查（`allow_from`）优先执行，通过后再检查是否被提及。
 
 下面按频道说明如何获取凭证并填写配置。
 
@@ -454,7 +459,9 @@
 可在工作台点击智能机器人-创建机器人，选择API模式创建-通过长链接配置
 
 ![创建机器人1](https://img.alicdn.com/imgextra/i3/O1CN01lcA2rX1fm2P19SLcB_!!6000000004048-2-tps-1440-814.png)
+
 ![新建机器人2](https://img.alicdn.com/imgextra/i1/O1CN014R3a0f1mnb3qbycMV_!!6000000004999-2-tps-1440-814.png)
+
 ![新建机器人3](https://img.alicdn.com/imgextra/i4/O1CN01kZDNVk1ugHf73ybs2_!!6000000006066-2-tps-2938-1594.png)
 
 获取`Bot ID`和`Secret`
@@ -534,7 +541,7 @@
 
 ### 备注
 
-目前telegram白名单机制仍在施工中，推荐个人场景部署，不暴露username到公共环境中。
+可使用本页顶部介绍的通用访问控制字段（`dm_policy`、`group_policy`、`allow_from`、`deny_message`、`require_mention`）控制谁可以与机器人交互。仍建议不要将 bot username 暴露到公共环境中。
 
 建议在 `@BotFather` 设置：
 
@@ -718,6 +725,14 @@ Matrix 频道通过 [matrix-nio](https://github.com/poljar/matrix-nio) 库将 Co
 | **agent_id** | 代理唯一标识   | -                                                |
 | **ws_url**   | WebSocket 地址 | `wss://hag.cloud.huawei.com/openclaw/v1/ws/link` |
 
+### 支持的文件类型
+
+**图片**：JPEG, JPG, PNG, BMP, WEBP
+
+**文件**：PDF, DOC, DOCX, PPT, PPTX, XLS, XLSX, TXT
+
+> 注：小艺平台限制，不支持视频和音频文件。
+
 ---
 
 ## 附录
@@ -735,6 +750,8 @@ Matrix 频道通过 [matrix-nio](https://github.com/poljar/matrix-nio) 库将 Co
 | Mattermost | mattermost | url, bot_token; 可选 show_typing, dm_policy, allow_from                                 |
 | Matrix     | matrix     | homeserver, user_id, access_token                                                       |
 | 小艺       | xiaoyi     | ak, sk, agent_id；可选 ws_url                                                           |
+
+所有频道均支持本页顶部「通用字段」中介绍的访问控制字段（`dm_policy`、`group_policy`、`allow_from`、`deny_message`、`require_mention`）。
 
 各频道字段与完整结构见上文表格及 [配置与工作目录](./config)。
 
@@ -754,7 +771,7 @@ Matrix 频道通过 [matrix-nio](https://github.com/poljar/matrix-nio) 库将 Co
 | Telegram   | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        |
 | Mattermost | ✓        | ✓        | 🚧       | 🚧       | ✓        | ✓        | ✓        | 🚧       | 🚧       | ✓        |
 | Matrix     | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        |
-| 小艺       | ✓        | 🚧       | 🚧       | 🚧       | 🚧       | ✓        | 🚧       | 🚧       | 🚧       | 🚧       |
+| 小艺       | ✓        | ✓        | ✗        | ✗        | ✓        | ✓        | 🚧       | 🚧       | 🚧       | 🚧       |
 
 说明：
 
@@ -766,7 +783,7 @@ Matrix 频道通过 [matrix-nio](https://github.com/poljar/matrix-nio) 库将 Co
 - **Telegram**：接收时附件会解析为文件并传入，可在telegram对话界面以对应格式打开（图片 / 语音 / 视频 / 文件）
 - **企业微信**：WebSocket 长连接接收，markdown/template_card 发送；支持接收文本、图片、语音和文件；发送媒体暂不支持（SDK 限制，仅支持通过 markdown 发送文本）。
 - **Matrix**：接收图片 / 视频 / 音频 / 文件（通过 `mxc://` 媒体 URL）；发送时将文件上传至服务器后以原生 Matrix 媒体消息（`m.image`、`m.video`、`m.audio`、`m.file`）发出。
-- **小艺**：当前仅支持文本。
+- **小艺**：支持接收文本、图片（JPEG/PNG/BMP/WEBP）和文件（PDF/DOC/DOCX/PPT/PPTX/XLS/XLSX/TXT）；平台限制不支持视频和音频。
 
 ### 通过 HTTP 修改配置
 

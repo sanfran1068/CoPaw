@@ -4,6 +4,7 @@ import {
   IAgentScopeRuntimeWebUIMessage,
 } from "@agentscope-ai/chat";
 import api, { type ChatSpec, type ChatHistory, type ChatStatus, type Message } from "../../../api";
+import { chatApi } from "../../../api/modules/chat";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -72,6 +73,13 @@ function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
+/** Turn a backend content URL (path or full URL) into a full URL for display. */
+function toDisplayUrl(url: string | undefined): string {
+  if (!url) return "";
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+  return chatApi.fileUrl(url.startsWith("/") ? url : `/${url}`);
+}
+
 /** Extract plain text from a message's content array. */
 const extractTextFromContent = (content: unknown): string => {
   if (typeof content === "string") return content;
@@ -82,6 +90,41 @@ const extractTextFromContent = (content: unknown): string => {
     .filter(Boolean)
     .join("\n");
 };
+
+/** Map backend message content to request card content (text + image + file). */
+function contentToRequestParts(
+  content: unknown,
+): Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return [{ type: "text", text: content, status: "created" }];
+  }
+  if (!Array.isArray(content)) {
+    return [{ type: "text", text: String(content || ""), status: "created" }];
+  }
+  const parts: Array<Record<string, unknown>> = [];
+  for (const c of content as ContentItem[]) {
+    if (c.type === "text") {
+      if (c.text) parts.push({ type: "text", text: c.text, status: "created" });
+    } else if (c.type === "image" && c.image_url) {
+      parts.push({
+        type: "image",
+        image_url: toDisplayUrl(c.image_url as string),
+        status: "created",
+      });
+    } else if (c.type === "file" && (c.file_url || c.file_id)) {
+      parts.push({
+        type: "file",
+        file_url: toDisplayUrl((c.file_url as string) || (c.file_id as string)),
+        file_name: (c.filename as string) || (c.file_name as string) || "file",
+        status: "created",
+      });
+    }
+  }
+  if (parts.length === 0) {
+    parts.push({ type: "text", text: "", status: "created" });
+  }
+  return parts;
+}
 
 /**
  * Convert a backend message to a response output message.
@@ -98,7 +141,7 @@ const toOutputMessage = (msg: Message): OutputMessage => ({
 
 /** Build a user card (AgentScopeRuntimeRequestCard) from a user message. */
 function buildUserCard(msg: Message): IAgentScopeRuntimeWebUIMessage {
-  const text = extractTextFromContent(msg.content);
+  const contentParts = contentToRequestParts(msg.content);
   return {
     id: (msg.id as string) || generateId(),
     role: "user",
@@ -110,7 +153,7 @@ function buildUserCard(msg: Message): IAgentScopeRuntimeWebUIMessage {
             {
               role: "user",
               type: "message",
-              content: [{ type: "text", text, status: "created" }],
+              content: contentParts,
             },
           ],
         },
@@ -224,8 +267,6 @@ const resolveRealId = (
   if (!realSession) return { list: sessionList, realId: null };
 
   const realUUID = realSession.id;
-  // Keep the timestamp as id (so the library's currentSessionId still matches),
-  // and store the real UUID in realId for backend requests.
   (realSession as ExtendedSession).realId = realUUID;
   realSession.id = tempSessionId;
   return {
@@ -382,8 +423,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
   }
 
   async getSessionList() {
-    // Deduplicate: reuse the in-flight request if one is already running so
-    // concurrent calls don't overwrite sessionList and lose realId mappings.
     if (this.sessionListRequest) return this.sessionListRequest;
 
     this.sessionListRequest = (async () => {
@@ -394,7 +433,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
           .map(chatSpecToSession)
           .reverse();
 
-        // Merge: preserve realId mappings (timestamp → UUID) stored in memory
         this.sessionList = newList.map((s) => {
           const existing = this.sessionList.find(
             (e) =>
@@ -416,8 +454,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
   }
 
   async getSession(sessionId: string) {
-    // Deduplicate: reuse the in-flight request if one is already running
-    // for the same sessionId so concurrent calls share one network request.
     const existingRequest = this.sessionRequests.get(sessionId);
     if (existingRequest) return existingRequest;
 
@@ -425,11 +461,7 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
     this.sessionRequests.set(sessionId, requestPromise);
 
     try {
-      const result = await requestPromise;
-      // Reconnect for running sessions is triggered by ChatPage when session
-      // status becomes "running" (useEffect on chatStatus), avoiding a fixed
-      // timeout and race conditions with the chat input ref.
-      return result;
+      return await requestPromise;
     } finally {
       this.sessionRequests.delete(sessionId);
     }
@@ -508,9 +540,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
     }
 
     // --- No session selected (e.g. after delete) ---
-    // Return a transient empty session; it is NOT added to sessionList so it
-    // never appears as a list item. The component will call createSession on
-    // the next submit via ensureSession.
     if (!sessionId || sessionId === "undefined" || sessionId === "null") {
       return this.createEmptySession(Date.now().toString());
     }
@@ -546,7 +575,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
     if (index > -1) {
       this.sessionList[index] = { ...this.sessionList[index], ...session };
 
-      // Timestamp session without realId yet — resolve in the background
       const existing = this.sessionList[index] as ExtendedSession;
       if (isLocalTimestamp(existing.id) && !existing.realId) {
         const tempId = existing.id;
@@ -559,7 +587,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
         });
       }
     } else {
-      // Session not found locally — refresh and resolve via session_id
       const tempId = session.id!;
       await this.getSessionList().then(() => {
         const { list, realId } = resolveRealId(this.sessionList, tempId);
@@ -597,7 +624,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
       | ExtendedSession
       | undefined;
 
-    // Use realId (UUID) when available; skip backend call for pure local sessions
     const deleteId =
       existing?.realId ?? (isLocalTimestamp(sessionId) ? null : sessionId);
 
@@ -605,8 +631,6 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
 
     this.sessionList = this.sessionList.filter((s) => s.id !== sessionId);
 
-    // Notify consumers (e.g. to clear the URL) with both the list id and the
-    // real backend UUID so callers can match either form.
     const resolvedId = existing?.realId ?? sessionId;
     this.onSessionRemoved?.(resolvedId);
 

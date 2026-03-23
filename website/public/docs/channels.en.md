@@ -14,6 +14,11 @@ All channels have common fields below:
 - **bot_prefix** — Prefix for bot replies (e.g. `[BOT]`) so they're easy to spot.
 - **filter_tool_messages** — (optional, default `false`) Filter tool call and output messages from being sent to users. Set to `true` to hide tool execution details.
 - **filter_thinking** — (optional, default `false`) Filter model thinking/reasoning content from being sent to users. Set to `true` to hide thinking blocks.
+- **dm_policy** — (optional, default `"open"`) Access policy for direct messages. `"open"` allows all users; `"allowlist"` restricts to users listed in `allow_from`.
+- **group_policy** — (optional, default `"open"`) Access policy for group chats. `"open"` allows all users; `"allowlist"` restricts to users listed in `allow_from`.
+- **allow_from** — (optional, default `[]`) List of user IDs allowed to interact with the bot. Only effective when `dm_policy` or `group_policy` is set to `"allowlist"`.
+- **deny_message** — (optional, default `""`) Message sent to users denied by the allowlist. If empty, denied users receive no reply.
+- **require_mention** — (optional, default `false`) When `true`, the bot only responds in group chats when explicitly @mentioned. The allowlist check (`allow_from`) runs first; if the user passes, the mention check is then applied.
 
 Below is how to get credentials and fill config for each channel.
 
@@ -541,7 +546,7 @@ If you need a proxy to access the Telegram API (e.g. for network restrictions):
 
 ### Notes
 
-The Telegram whitelist mechanism is still under construction. It is recommended to deploy for personal use only and avoid exposing your bot username publicly.
+To control who can interact with the bot, use the common access control fields (`dm_policy`, `group_policy`, `allow_from`, `deny_message`, `require_mention`) described at the top of this page. It is still recommended to avoid exposing your bot username publicly.
 
 It is recommended to configure the following in `@BotFather`:
 
@@ -725,6 +730,14 @@ The XiaoYi channel connects CoPaw via **A2A (Agent-to-Agent) protocol** over Web
 | **agent_id** | Agent unique identifier | -                                                |
 | **ws_url**   | WebSocket URL           | `wss://hag.cloud.huawei.com/openclaw/v1/ws/link` |
 
+### Supported File Types
+
+**Images**: JPEG, JPG, PNG, BMP, WEBP
+
+**Files**: PDF, DOC, DOCX, PPT, PPTX, XLS, XLSX, TXT
+
+> Note: Video and audio files are not supported by the XiaoYi platform.
+
 ---
 
 ## Appendix
@@ -743,6 +756,8 @@ The XiaoYi channel connects CoPaw via **A2A (Agent-to-Agent) protocol** over Web
 | Mattermost | mattermost | url, bot_token; optional show_typing, dm_policy, allow_from             |
 | Matrix     | matrix     | homeserver, user_id, access_token                                       |
 | XiaoYi     | xiaoyi     | ak, sk, agent_id; optional ws_url                                       |
+
+All channels also support the common access control fields (`dm_policy`, `group_policy`, `allow_from`, `deny_message`, `require_mention`) documented in the common fields section at the top of this page.
 
 Field details and structure are in the tables above and [Config & working dir](./config).
 
@@ -764,7 +779,7 @@ done). **✗** = not supported (not possible on this channel).
 | Telegram   | ✓         | ✓          | ✓          | ✓          | ✓         | ✓         | ✓          | ✓          | ✓          | ✓         |
 | Mattermost | ✓         | ✓          | 🚧         | 🚧         | ✓         | ✓         | ✓          | 🚧         | 🚧         | ✓         |
 | Matrix     | ✓         | ✓          | ✓          | ✓          | ✓         | ✓         | ✓          | ✓          | ✓          | ✓         |
-| XiaoYi     | ✓         | 🚧         | 🚧         | 🚧         | 🚧        | ✓         | 🚧         | 🚧         | 🚧         | 🚧        |
+| XiaoYi     | ✓         | ✓          | ✗          | ✗          | ✓         | ✓         | 🚧         | 🚧         | 🚧         | 🚧        |
 
 Notes:
 
@@ -782,7 +797,7 @@ Notes:
 - **Telegram**: Attachments are parsed as files on receive and can be opened in the corresponding format (image / voice / video / file) within the Telegram chat interface.
 - **WeCom**: WebSocket long connection for receiving; markdown/template_card for sending. Supports text, image, voice, and file receiving; sending media is not supported by the SDK (only text via markdown).
 - **Matrix**: Receives image, video, audio, and file attachments via `mxc://` media URLs. Sends media by uploading to the homeserver and sending native Matrix media messages (`m.image`, `m.video`, `m.audio`, `m.file`).
-- **XiaoYi**: Text only; media support is 🚧.
+- **XiaoYi**: Supports receiving text, images (JPEG/PNG/BMP/WEBP), and files (PDF/DOC/DOCX/PPT/PPTX/XLS/XLSX/TXT); video and audio are not supported by the platform.
 
 ### Changing config via HTTP
 

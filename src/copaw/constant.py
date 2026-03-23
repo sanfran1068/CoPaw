@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env file from project root before reading any env vars
+_env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
 
 
 class EnvVarLoader:
@@ -128,12 +134,6 @@ PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH_ENV = "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"
 # When True, expose /docs, /redoc, /openapi.json
 # (dev only; keep False in prod).
 DOCS_ENABLED = EnvVarLoader.get_bool("COPAW_OPENAPI_DOCS", False)
-
-# Skills directories
-# Active skills directory (activated skills that agents use)
-ACTIVE_SKILLS_DIR = WORKING_DIR / "active_skills"
-# Customized skills directory (user-created skills)
-CUSTOMIZED_SKILLS_DIR = WORKING_DIR / "customized_skills"
 
 # Memory directory
 MEMORY_DIR = WORKING_DIR / "memory"
