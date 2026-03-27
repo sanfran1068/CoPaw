@@ -1,0 +1,118 @@
+.chatSessionItem {
+  position: relative;
+  display: flex;
+  height: 77px;
+  flex-shrink: 0;
+  border-radius: 6px;
+  gap: 8px;
+  background-color: var(--efm_ant-color-bg-base);
+  cursor: pointer;
+  overflow: hidden;
+  transition: background-color 0.2s;
+
+  &:hover {
+    border-radius: 6px;
+    background: var(--color-fill-tertiary, rgba(43, 18, 0, 0.03));
+
+    .actions {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .iconPlaceholder {
+    
+      // 纵向连接线，贯穿 item 全高，与相邻 item 视觉连续
+      // 线居于 24px 宽容器正中（x = 11.5px）
+      &::before {
+        background-color: var(--colorBorder, #C1BEBB);
+        transition: background-color 0.2s;
+      }
+    
+      // 时间节点圆点，叠在连接线上方，6x6px，圆心与连接线对齐
+      &::after {
+        border: 1px solid var(--colorBorder, #C1BEBB);
+        transition: background-color 0.2s;
+      }
+    }
+  }
+
+  &.active {
+    border-radius: 6px;
+    background: var(--color-fill-tertiary, rgba(43, 18, 0, 0.03));
+  }
+
+  // 编辑模式下输入框距右侧保留间距
+  &.editing {
+    .content {
+      padding-right: 12px;
+    }
+  }
+}
+
+.iconPlaceholder {
+  width: 24px;
+  flex-shrink: 0;
+  position: relative;
+
+  // 纵向连接线，贯穿 item 全高，与相邻 item 视觉连续
+  // 线居于 24px 宽容器正中（x = 11.5px）
+  &::before {
+    content: '';
+    position: absolute;
+    left: calc(50% - 0.5px);
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background-color: var(--colorBorder, #d9d9d9);
+  }
+
+  // 时间节点圆点，叠在连接线上方，6x6px，圆心与连接线对齐
+  &::after {
+    content: '';
+    position: absolute;
+    left: calc(50% - 3px);
+    top: 20px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background-color: var(--colorBgBase, #fff);
+    border: 1px solid var(--colorBorder, #d9d9d9);
+    z-index: 1;
+  }
+}
+
+.content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 14px;
+}
+
+.name {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 24px;
+  color: var(--colorText, #1A1716);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.time {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--colorTextSecondary, rgba(26, 23, 22, 0.45));
+}
+
+.actions {
+  position: absolute;
+  right: 16px;
+  top: 14px;
+  display: flex;
+  gap: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
