@@ -1,8 +1,8 @@
-import React from 'react';
-import { Input } from 'antd';
-import { IconButton } from '@agentscope-ai/design';
-import { SparkEditLine, SparkDeleteLine } from '@agentscope-ai/icons';
-import styles from './index.module.less';
+import React from "react";
+import { Input } from "antd";
+import { IconButton } from "@agentscope-ai/design";
+import { SparkEditLine, SparkDeleteLine } from "@agentscope-ai/icons";
+import styles from "./index.module.less";
 
 interface ChatSessionItemProps {
   /** Session display name */
@@ -33,13 +33,18 @@ interface ChatSessionItemProps {
 const ChatSessionItem: React.FC<ChatSessionItemProps> = (props) => {
   const className = [
     styles.chatSessionItem,
-    props.active ? styles.active : '',
-    props.editing ? styles.editing : '',
-    props.className || '',
-  ].filter(Boolean).join(' ');
+    props.active ? styles.active : "",
+    props.editing ? styles.editing : "",
+    props.className || "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
-    <div className={className} onClick={props.editing ? undefined : props.onClick}>
+    <div
+      className={className}
+      onClick={props.editing ? undefined : props.onClick}
+    >
       {/* Timeline indicator placeholder */}
       <div className={styles.iconPlaceholder} />
       <div className={styles.content}>

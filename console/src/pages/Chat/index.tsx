@@ -529,7 +529,11 @@ export default function ChatPage() {
           customRequest: handleFileUpload,
         },
       },
-      session: { multiple: true, hideBuiltInSessionList: true, api: sessionApi },
+      session: {
+        multiple: true,
+        hideBuiltInSessionList: true,
+        api: sessionApi,
+      },
       api: {
         ...defaultConfig.api,
         fetch: customFetch,

@@ -22,12 +22,12 @@
     .iconPlaceholder {
       // Highlight connector line and dot on hover
       &::before {
-        background-color: var(--colorBorder, #C1BEBB);
+        background-color: var(--colorBorder, #c1bebb);
         transition: background-color 0.2s;
       }
 
       &::after {
-        border: 1px solid var(--colorBorder, #C1BEBB);
+        border: 1px solid var(--colorBorder, #c1bebb);
         transition: background-color 0.2s;
       }
     }
@@ -53,7 +53,7 @@
 
   // Vertical connector line centered in the 24px container (x = 11.5px)
   &::before {
-    content: '';
+    content: "";
     position: absolute;
     left: calc(50% - 0.5px);
     top: 0;
@@ -64,7 +64,7 @@
 
   // Timeline dot (6x6px) centered on the connector line
   &::after {
-    content: '';
+    content: "";
     position: absolute;
     left: calc(50% - 3px);
     top: 20px;
@@ -90,7 +90,7 @@
   font-size: 14px;
   font-weight: 500;
   line-height: 24px;
-  color: var(--colorText, #1A1716);
+  color: var(--colorText, #1a1716);
   text-overflow: ellipsis;
   white-space: nowrap;
   overflow: hidden;

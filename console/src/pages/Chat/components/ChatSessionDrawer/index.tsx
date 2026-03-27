@@ -1,12 +1,15 @@
-import React, { useCallback, useState } from 'react';
-import { Drawer } from 'antd';
-import { IconButton } from '@agentscope-ai/design';
-import { SparkOperateRightLine } from '@agentscope-ai/icons';
-import { useChatAnywhereSessionsState, useChatAnywhereSessions } from '@agentscope-ai/chat';
-import { chatApi } from '../../../../api/modules/chat';
-import sessionApi from '../../sessionApi';
-import ChatSessionItem from '../ChatSessionItem';
-import styles from './index.module.less';
+import React, { useCallback, useState } from "react";
+import { Drawer } from "antd";
+import { IconButton } from "@agentscope-ai/design";
+import { SparkOperateRightLine } from "@agentscope-ai/icons";
+import {
+  useChatAnywhereSessionsState,
+  useChatAnywhereSessions,
+} from "@agentscope-ai/chat";
+import { chatApi } from "../../../../api/modules/chat";
+import sessionApi from "../../sessionApi";
+import ChatSessionItem from "../ChatSessionItem";
+import styles from "./index.module.less";
 
 interface ChatSessionDrawerProps {
   /** Whether the drawer is visible */
@@ -17,11 +20,15 @@ interface ChatSessionDrawerProps {
 
 /** Format an ISO 8601 timestamp to YYYY-MM-DD HH:mm:ss */
 const formatCreatedAt = (raw: string | null | undefined): string => {
-  if (!raw) return '';
+  if (!raw) return "";
   const date = new Date(raw);
-  if (isNaN(date.getTime())) return '';
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  if (isNaN(date.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(
+    date.getSeconds(),
+  )}`;
 };
 
 /** Resolve the real backend UUID from an ExtendedSession record (id may be a local timestamp) */
@@ -33,12 +40,8 @@ const getBackendId = (session: Record<string, unknown>): string | null => {
 };
 
 const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
-  const {
-    sessions,
-    currentSessionId,
-    setCurrentSessionId,
-    setSessions,
-  } = useChatAnywhereSessionsState();
+  const { sessions, currentSessionId, setCurrentSessionId, setSessions } =
+    useChatAnywhereSessionsState();
 
   const { createSession } = useChatAnywhereSessions();
 
@@ -51,7 +54,7 @@ const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
   /** ID of the session currently being renamed */
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   /** Current value of the rename input */
-  const [editValue, setEditValue] = useState('');
+  const [editValue, setEditValue] = useState("");
 
   /** Re-fetch session list from the backend and sync to context state */
   const refreshSessions = useCallback(async () => {
@@ -69,7 +72,10 @@ const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
   /** Delete a session: call deleteChat API then refresh the list */
   const handleDelete = useCallback(
     async (sessionId: string) => {
-      const session = sessions.find((s) => s.id === sessionId) as Record<string, unknown>;
+      const session = sessions.find((s) => s.id === sessionId) as Record<
+        string,
+        unknown
+      >;
       const backendId = session ? getBackendId(session) : null;
 
       if (backendId) {
@@ -87,10 +93,13 @@ const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
   );
 
   /** Enter rename mode for a session */
-  const handleEditStart = useCallback((sessionId: string, currentName: string) => {
-    setEditingSessionId(sessionId);
-    setEditValue(currentName);
-  }, []);
+  const handleEditStart = useCallback(
+    (sessionId: string, currentName: string) => {
+      setEditingSessionId(sessionId);
+      setEditValue(currentName);
+    },
+    [],
+  );
 
   /** Update rename input value */
   const handleEditChange = useCallback((value: string) => {
@@ -101,7 +110,10 @@ const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
   const handleEditSubmit = useCallback(async () => {
     if (!editingSessionId) return;
 
-    const session = sessions.find((s) => s.id === editingSessionId) as Record<string, unknown>;
+    const session = sessions.find((s) => s.id === editingSessionId) as Record<
+      string,
+      unknown
+    >;
     const backendId = session ? getBackendId(session) : null;
     const newName = editValue.trim();
 
@@ -115,19 +127,19 @@ const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
         channel: session.channel as string,
         created_at: (session.createdAt as string | null) ?? null,
         meta: session.meta as Record<string, unknown> | undefined,
-        status: session.status as 'idle' | 'running' | undefined,
+        status: session.status as "idle" | "running" | undefined,
       });
     }
 
     setEditingSessionId(null);
-    setEditValue('');
+    setEditValue("");
     await refreshSessions();
   }, [editingSessionId, editValue, sessions, refreshSessions]);
 
   /** Cancel rename mode */
   const handleEditCancel = useCallback(() => {
     setEditingSessionId(null);
-    setEditValue('');
+    setEditValue("");
   }, []);
 
   return (
@@ -139,9 +151,15 @@ const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
       closable={false}
       title={null}
       styles={{
-        header: { display: 'none' },
-        body: { padding: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' },
-        mask: { background: 'transparent' },
+        header: { display: "none" },
+        body: {
+          padding: 0,
+          display: "flex",
+          flexDirection: "column",
+          height: "100%",
+          overflow: "hidden",
+        },
+        mask: { background: "transparent" },
       }}
       className={styles.drawer}
     >
@@ -175,13 +193,17 @@ const ChatSessionDrawer: React.FC<ChatSessionDrawerProps> = (props) => {
             return (
               <ChatSessionItem
                 key={session.id}
-                name={session.name || 'New Chat'}
+                name={session.name || "New Chat"}
                 time={formatCreatedAt(raw.createdAt as string | null)}
                 active={session.id === currentSessionId}
                 editing={editingSessionId === session.id}
-                editValue={editingSessionId === session.id ? editValue : undefined}
+                editValue={
+                  editingSessionId === session.id ? editValue : undefined
+                }
                 onClick={() => handleSessionClick(session.id!)}
-                onEdit={() => handleEditStart(session.id!, session.name || 'New Chat')}
+                onEdit={() =>
+                  handleEditStart(session.id!, session.name || "New Chat")
+                }
                 onDelete={() => handleDelete(session.id!)}
                 onEditChange={handleEditChange}
                 onEditSubmit={handleEditSubmit}
