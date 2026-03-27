@@ -22,16 +22,6 @@
   cursor: not-allowed !important;
 }
 
-.chatMessagesArea {
-  :global {
-    [class*="chat-anywhere-default-header-right"] {
-      flex: 1;
-      display: flex;
-      align-items: center;
-    }
-  }
-}
-
 /* Chat messages scrollable area */
 .chatMessagesArea {
   flex: 1;
@@ -40,6 +30,14 @@
   width: 100%;
   overflow-y: auto;
   overflow-x: hidden;
+
+  :global {
+    [class*="chat-anywhere-default-header-right"] {
+      flex: 1;
+      display: flex;
+      align-items: center;
+    }
+  }
 
   /* Custom scrollbar */
   &::-webkit-scrollbar {

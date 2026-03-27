@@ -10,7 +10,7 @@ const ChatActionGroup: React.FC = () => {
   const { createSession } = useChatAnywhereSessions();
 
   return (
-    <Flex gap={8} align="center" style={{ marginLeft: '14px'}}>
+    <Flex gap={8} align="center">
       <IconButton
         bordered={false}
         icon={<SparkNewChatFill />}
