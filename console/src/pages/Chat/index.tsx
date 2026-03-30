@@ -349,7 +349,10 @@ export default function ChatPage() {
       }
 
       // Suppress the stale getSession callback that arrives after the correct session loads.
-      if (staleAutoSelectedIdRef.current && staleAutoSelectedIdRef.current === targetId) {
+      if (
+        staleAutoSelectedIdRef.current &&
+        staleAutoSelectedIdRef.current === targetId
+      ) {
         staleAutoSelectedIdRef.current = null;
         return;
       }
