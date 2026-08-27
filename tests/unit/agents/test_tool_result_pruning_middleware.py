@@ -31,6 +31,7 @@ from qwenpaw.agents.tools.utils import (  # noqa: E402
     TRUNCATION_METADATA_KEY,
 )
 from qwenpaw.config.config import (  # noqa: E402
+    ContextCompactConfig,
     LightContextConfig,
     ScrollContextConfig,
     ToolResultPruningConfig,
@@ -570,7 +571,7 @@ def test_builder_adds_pruning_for_scroll_strategy(tmp_path):
     )
 
 
-def test_context_config_disables_agentscope_duplicate_tool_result_cap():
+def test_context_config_disables_agentscope_duplicate_context_limits():
     agent_config = types.SimpleNamespace(
         running=types.SimpleNamespace(
             light_context_config=LightContextConfig(
@@ -586,6 +587,13 @@ def test_context_config_disables_agentscope_duplicate_tool_result_cap():
     context_config = AgentBuilder._build_context_config(agent_config)
 
     assert context_config.tool_result_limit == 2**63 - 1
+    assert context_config.max_image_num == 2**63 - 1
+
+
+def test_context_config_fallback_keeps_image_limit_non_binding():
+    context_config = AgentBuilder._build_context_config(object())
+
+    assert context_config.max_image_num == 2**63 - 1
 
 
 @pytest.mark.asyncio
@@ -650,6 +658,26 @@ def test_context_config_keeps_agentscope_cap_when_pruning_is_disabled():
         context_config.tool_result_limit
         == ContextConfig.model_fields["tool_result_limit"].default
     )
+
+
+def test_context_config_clamps_reserve_below_trigger(caplog):
+    agent_config = types.SimpleNamespace(
+        running=types.SimpleNamespace(
+            light_context_config=LightContextConfig(
+                context_compact_config=ContextCompactConfig(
+                    compact_threshold_ratio=0.2,
+                    reserve_threshold_ratio=0.2,
+                ),
+            ),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        context_config = AgentBuilder._build_context_config(agent_config)
+
+    assert context_config.trigger_ratio == 0.2
+    assert 0 < context_config.reserve_ratio < context_config.trigger_ratio
+    assert "must be smaller than trigger ratio" in caplog.text
 
 
 def test_explicit_legacy_scroll_tool_cap_warns_once_and_is_not_saved(

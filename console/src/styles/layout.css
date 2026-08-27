@@ -784,11 +784,11 @@ html.dark-mode [class*="chat-anywhere"] [class*="message"] h6,
 html.dark-mode
   [class*="chat-anywhere"]
   [class*="message"]
-  span:not([class*="diffAddBadge"]):not([class*="diffDelBadge"]):not(
-    [class*="lineReadBadge"]
-  ):not([class*="lineSearchBadge"]):not([class*="jsonKey"]):not(
-    [class*="jsonStr"]
-  ):not([class*="jsonNum"]):not([class*="jsonNull"]),
+  span:not(.qwenpaw-code-block span):not([class*="diffAddBadge"]):not(
+    [class*="diffDelBadge"]
+  ):not([class*="lineReadBadge"]):not([class*="lineSearchBadge"]):not(
+    [class*="jsonKey"]
+  ):not([class*="jsonStr"]):not([class*="jsonNum"]):not([class*="jsonNull"]),
 html.dark-mode [class*="chat-anywhere"] [class*="message"] blockquote,
 html.dark-mode [class*="chat-anywhere"] [class*="message"] td,
 html.dark-mode [class*="chat-anywhere"] [class*="message"] th {
@@ -800,7 +800,10 @@ html.dark-mode [class*="chat-anywhere"] [class*="message"] b {
   color: rgba(255, 255, 255, 0.95) !important;
 }
 
-html.dark-mode [class*="chat-anywhere"] [class*="message"] code {
+html.dark-mode
+  [class*="chat-anywhere"]
+  [class*="message"]
+  code:not(.qwenpaw-code-block code) {
   color: rgba(255, 255, 255, 0.85) !important;
   background: rgba(255, 255, 255, 0.08) !important;
 }
@@ -866,11 +869,15 @@ html.dark-mode
   padding-bottom: env(safe-area-inset-bottom, 0px) !important;
 }
 
-/* When the virtual keyboard is open (supported browsers), shrink viewport */
+/* When the virtual keyboard is open (supported browsers), shrink viewport.
+   Touch devices only: on desktop the chat sits below the header, so
+   forcing 100dvh overflows the container and hides the sender. */
 @supports (height: 100dvh) {
-  .qwenpaw-chat-anywhere-chat,
-  [class*="chat-anywhere-chat"] {
-    height: 100dvh;
+  @media (hover: none) and (pointer: coarse) {
+    .qwenpaw-chat-anywhere-chat,
+    [class*="chat-anywhere-chat"] {
+      height: 100dvh;
+    }
   }
 }
 
@@ -890,6 +897,7 @@ html.dark-mode
 
 #root {
   height: 100%;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -901,6 +909,8 @@ html.dark-mode
 }
 
 .ant-layout-content {
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
   background: #f9f8f4;
 }
@@ -985,6 +995,8 @@ html.dark-mode .qwenpaw-sender-content {
 
 .page-container {
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -998,6 +1010,8 @@ html.dark-mode .qwenpaw-sender-content {
 
 .page-content {
   flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
   overflow: auto;
   background-color: #fff;
   border-radius: 8px;
@@ -1005,6 +1019,22 @@ html.dark-mode .qwenpaw-sender-content {
   box-sizing: border-box;
   border: 1px solid #eae9e7;
   /* #EAE9E7 */
+}
+
+@supports (height: 100dvh) {
+  @media (max-width: 768px) {
+    .ant-layout {
+      min-height: 100dvh;
+      max-height: 100dvh;
+    }
+  }
+}
+
+@media (max-width: 768px) {
+  .page-container {
+    padding-right: 0;
+    padding-bottom: 0;
+  }
 }
 
 .table-container {

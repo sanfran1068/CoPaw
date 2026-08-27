@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # flake8: noqa: E501
 # pylint: disable=consider-using-with,raise-missing-from,too-many-branches
-# pylint: disable=too-many-statements,unused-argument
+# pylint: disable=too-many-statements,unused-argument,too-many-return-statements
 """File-native local video execution for edit and composition commands.
 
 The service freezes one ``project.json`` snapshot, resolves every input through
@@ -18,9 +18,11 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+import concurrent.futures
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
+from html import unescape
 import json
 import math
 import mimetypes
@@ -30,6 +32,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import subprocess
+import tempfile
 from typing import Any, Protocol, TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
 
@@ -51,7 +54,20 @@ from services.media_files.overlay import (
     render_interview_summary_overlay,
     render_pet_os_overlay,
 )
-from services.media_files.motion_overlay import render_motion_overlay
+from services.media_files.motion_engine import full_engine_digest
+from services.media_files.motion_overlay import (
+    PreparedMotionLayer,
+    caption_layout_error,
+    composite_motion_layers,
+    prepare_motion_layer,
+    probe_motion_document,
+    render_motion_overlay,
+)
+from services.media_files.beat_grid import (
+    BeatGridUnavailable,
+    extract_beat_grid,
+)
+from services.media_files.motion_templates import render_caption_template
 from services.media_files.transitions import (
     SUPPORTED_XFADE_KINDS,
     TransitionClip,
@@ -59,6 +75,7 @@ from services.media_files.transitions import (
     build_transition_filter_chain,
     normalize_transition_kind,
 )
+from services.observability import report_error
 from services.project_files.assets import (
     AssetAlreadyExists,
     AssetFileError,
@@ -68,13 +85,18 @@ from services.project_files.models import (
     ArtifactSlot,
     ArtifactVersion,
     ArtifactVersionRenderSource,
+    AudioCreation,
     EditCreation,
     ElementOutputRenderSource,
+    I2VCreation,
     IndexedFile,
+    MotionClipCreation,
     OverlayCreation,
     Project,
     R2VCreation,
+    S2VCreation,
     SourceVersionRenderSource,
+    T2VCreation,
     Timeline,
     TimelineElement,
     TransitionCreation,
@@ -83,7 +105,11 @@ from services.media_files.element_adapter import (
     find_timeline_element,
     selected_element_output,
 )
-from services.media_files.review_admission import assert_media_review_admission
+from services.media_files.review_admission import (
+    assert_media_review_admission,
+    media_review_policy,
+)
+from services.render_review.review import schedule_render_review
 from services.project_files.remote_cache import (
     public_source_url,
     resolve_remote_cache,
@@ -120,6 +146,12 @@ if TYPE_CHECKING:
 
 logger = setup_logger("services.media_files.local_execution")
 
+
+def _log_safe(value: object) -> str:
+    """Neutralize CR/LF in user-provided values before logging."""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+
+
 _RETIRED_MOTION_MOTIFS = (
     "speed_lines",
     "side_eye",
@@ -136,8 +168,64 @@ _LOCAL_MEDIA_COMMANDS = frozenset(
     },
 )
 _MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024
+# Motion layers burned per ffmpeg pass: enough to cover a typical caption
+# stack in one encode while keeping the filter graph and PNG-sequence
+# input memory bounded.
+_MOTION_BURN_BATCH_SIZE = 8
+# Finished-segment cache: re-renders of an unchanged segment (same source
+# content, trims, canvas and overlay stack) are byte-for-byte identical, so
+# an edit to one Element re-renders only its own segment.
+_SEGMENT_CACHE_MAX_ITEMS = 96
+# Renderer behaviour version for cached segments; bump on any semantic
+# change to segment rendering or overlay burning.
+_SEGMENT_CACHE_VERSION = 3
+
+
+@dataclass(frozen=True, slots=True)
+class _SegmentRender:
+    """Outcome of rendering one timeline segment."""
+
+    path: Path
+    duration: float
+    warnings: tuple[str, ...]
+
+
 _DEFAULT_FFMPEG_TIMEOUT_SECONDS = 15 * 60.0
 _DEFAULT_FFMPEG_TERMINATION_GRACE_SECONDS = 5.0
+# Original-footage volume while a Timeline audio Element (narration) plays;
+# ~-9dB keeps ambience audible without competing with the voice.
+_DUCK_VOLUME = 0.35
+# BGM plays as one continuous low bed under the whole mix; the fixed bed
+# gain keeps music from competing with native dialogue and ambience.
+_BGM_BED_GAIN_DB = -12.0
+# BGM volume while any speech window (shot dialogue, s2v, narration) plays.
+_BGM_DUCK_VOLUME = 0.4
+# Unset bgm fades default to min(this, span/4): musical edges for a long
+# bed without swallowing a short segment. Explicit creation fades win.
+_BGM_DEFAULT_FADE_SECONDS = 2.0
+# Delivery loudness target for the finished film (short-form video norm).
+# Applied as a two-pass *linear* loudnorm so layer level relationships
+# (music bed vs. ducked speech windows) survive normalization.
+_LOUDNORM_TARGET_I = -16.0
+_LOUDNORM_TARGET_TP = -1.5
+_LOUDNORM_TARGET_LRA = 11.0
+# Beat-snapped xfades must keep a perceptible blend; below this the join
+# effectively degrades to a cut and the snap is skipped instead.
+_MIN_SNAPPED_BLEND_SECONDS = 0.05
+
+
+def _merge_windows(
+    windows: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Merge overlapping [start, end) windows so ducking applies once."""
+
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(windows):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,10 +239,15 @@ class LocalMediaInput:
     start_seconds: float | None = None
     end_seconds: float | None = None
     duration_seconds: float | None = None
+    playback_rate: float = 1.0
     original_sound: str = "preserve"
     location: Mapping[str, Any] | None = None
-    overlay: Mapping[str, Any] | None = None
+    overlays: tuple[Mapping[str, Any], ...] = ()
     motions: tuple[Mapping[str, Any], ...] = ()
+    # A full-canvas motion document that IS the segment's picture (pure
+    # motion-graphics cut): the renderer paints it over an opaque base
+    # for the whole span instead of cutting from a media file.
+    motion_clip: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +263,11 @@ class LocalMediaExecutionSpec:
     expected_duration_seconds: float | None
     canvas_size: tuple[int, int]
     on_element_done: Callable[[int, int], None] | None = None
+    audio_tracks: tuple[Mapping[str, Any], ...] = ()
+    # [start, end) seconds where clips natively speak (shot dialogue, s2v);
+    # BGM ducks itself inside these windows.
+    speech_windows: tuple[tuple[float, float], ...] = ()
+    color_grade: str = ""
 
 
 def _input_render_element_ids(item: LocalMediaInput) -> frozenset[str]:
@@ -178,10 +276,11 @@ def _input_render_element_ids(item: LocalMediaInput) -> frozenset[str]:
         ids.add(item.source_ref.removeprefix("element:"))
     else:
         ids.add(f"input:{item.version_id}")
-    if isinstance(item.overlay, Mapping):
-        element_id = item.overlay.get("element_id")
-        if isinstance(element_id, str) and element_id:
-            ids.add(element_id)
+    for overlay in item.overlays:
+        if isinstance(overlay, Mapping):
+            element_id = overlay.get("element_id")
+            if isinstance(element_id, str) and element_id:
+                ids.add(element_id)
     for motion in item.motions:
         element_id = motion.get("element_id")
         if isinstance(element_id, str) and element_id:
@@ -204,6 +303,48 @@ class LocalMediaRunner(Protocol):
 
     async def render(self, spec: LocalMediaExecutionSpec) -> Mapping[str, Any]:
         ...
+
+
+# Unified colour-grade presets applied to the whole composited cut.
+# Every preset must keep skin tones natural: gentle eq lifts plus a small
+# colour-balance shift, never LUT-strength stylisation.
+_COLOR_GRADE_FILTERS: dict[str, str] = {
+    # 明亮、温暖、清新：家庭 Vlog 默认暖色基调。
+    "warm_bright": (
+        "eq=brightness=0.02:saturation=1.12:gamma=1.03,"
+        "colorbalance=rm=0.03:gm=0.01:bm=-0.04:rh=0.02:bh=-0.02"
+    ),
+    # 冷静通透：科技/城市内容的冷色基调。
+    "clean_cool": (
+        "eq=brightness=0.01:saturation=1.05:gamma=1.02,"
+        "colorbalance=rm=-0.02:bm=0.04:bh=0.02"
+    ),
+    # 电影感：压暗部、轻微去饱和。
+    "cinematic": (
+        "eq=brightness=-0.01:saturation=0.96:contrast=1.08:gamma=0.98,"
+        "colorbalance=rs=-0.02:gs=-0.01:bs=-0.03:bh=-0.02"
+    ),
+    # 日常清新：暖中间调、黄红饱和度提升。
+    "vlog_fresh": (
+        "eq=brightness=0.02:saturation=1.10:gamma=1.04,"
+        "colorbalance=rm=0.04:gm=0.02:bm=-0.03:rh=0.01:bh=-0.01"
+    ),
+    # 水墨淡雅：去饱和中间调、冷移、提黑、低对比。
+    "ink_wash": (
+        "eq=brightness=0.01:saturation=0.88:contrast=0.96:gamma=1.06,"
+        "colorbalance=rm=-0.02:gm=-0.01:bm=0.03:rh=-0.01:bh=0.02"
+    ),
+    # 舞台戏剧：高对比、压暗部、暖高光。
+    "stage_drama": (
+        "eq=brightness=-0.02:saturation=1.04:contrast=1.14:gamma=0.95,"
+        "colorbalance=rm=0.04:gm=0.01:bm=-0.03:rh=0.05:bh=0.02"
+    ),
+    # 霓虹鲜艳：高饱和、冷暗/暖亮分裂调色。
+    "neon_vivid": (
+        "eq=brightness=0.0:saturation=1.22:contrast=1.10:gamma=0.97,"
+        "colorbalance=rm=-0.03:gm=-0.02:bm=0.05:rh=0.04:gh=0.01:bh=-0.02"
+    ),
+}
 
 
 class FfmpegLocalMediaRunner:
@@ -259,13 +400,14 @@ class FfmpegLocalMediaRunner:
         )
         total_elements = len(remaining_element_occurrences)
         tail_trims, joins_by_pair = self._transition_directives(spec)
+        self._snap_transitions_to_beats(spec, tail_trims, joins_by_pair)
         if spec.command in (
             CreatorCommandType.EXECUTE_EDIT,
             CreatorCommandType.COMPOSE_FINAL_VIDEO,
         ) or any(
             item.start_seconds is not None
             or item.location is not None
-            or item.overlay is not None
+            or item.overlays
             or item.motions
             for item in spec.inputs
         ):
@@ -273,80 +415,75 @@ class FfmpegLocalMediaRunner:
                 spec.work_dir,
                 "segments",
             )
-            for index, item in enumerate(spec.inputs):
-                start_seconds = item.start_seconds or 0.0
-                end_seconds = item.end_seconds
-                if end_seconds is None:
-                    if item.duration_seconds is None:
-                        raise ValidationError(
-                            "Edit Element 缺少可执行 source range",
-                        )
-                    end_seconds = start_seconds + item.duration_seconds
-                # For a transition pair, the tail of the `from` segment that
-                # the `to` segment covers is simply not rendered; the rest of
-                # the overlap is consumed by the xfade blend.
-                tail_trim = tail_trims.get(item.source_ref, 0.0)
-                segment_duration = max(
-                    1 / 30,
-                    end_seconds - start_seconds - tail_trim,
+            concurrency = self._segment_concurrency(len(spec.inputs))
+            outcomes: dict[int, _SegmentRender] = {}
+            done_signals = 0
+
+            def _report_done(index: int) -> None:
+                # Progress ticks fire in completion order; the completed
+                # count is monotonic because every tick only decrements
+                # the shared occurrence counter. Thread-safety note: this
+                # closure runs exclusively on the coordinating thread (the
+                # serial loop, or the as_completed() consumer) — worker
+                # threads only execute _render_one_segment and never touch
+                # the counter, so no lock is needed here.
+                if spec.on_element_done is None:
+                    return
+                for element_id in input_element_ids[index]:
+                    remaining_element_occurrences[element_id] -= 1
+                completed_elements = sum(
+                    remaining == 0
+                    for remaining in remaining_element_occurrences.values()
                 )
-                segment = segment_dir / f"{index:06d}.mp4"
-                placement_filter = self._placement_filter(
-                    item.location,
-                    canvas_size=spec.canvas_size,
-                    duration_seconds=segment_duration,
-                )
-                self._run(
-                    [
-                        "-y",
-                        "-ss",
-                        f"{start_seconds:.6f}",
-                        "-t",
-                        f"{segment_duration:.6f}",
-                        "-i",
-                        os.fspath(item.path),
-                        "-filter_complex",
-                        placement_filter,
-                        "-map",
-                        "[outv]",
-                        "-map",
-                        "0:a?",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-c:a",
-                        "aac",
-                        "-movflags",
-                        "+faststart",
-                        os.fspath(segment),
-                    ],
-                    cwd=spec.work_dir,
-                )
-                warning = self._apply_overlay(item, segment)
-                if warning is not None:
-                    overlay_warnings.append(
-                        f"{item.source_ref or item.version_id}: {warning}",
+                spec.on_element_done(completed_elements, total_elements)
+
+            if concurrency <= 1 or len(spec.inputs) <= 1:
+                for index, item in enumerate(spec.inputs):
+                    outcomes[index] = self._render_one_segment(
+                        spec,
+                        index,
+                        item,
+                        segment_dir=segment_dir,
+                        tail_trims=tail_trims,
                     )
-                for warning in self._apply_motion_overlays(item, segment):
-                    overlay_warnings.append(
-                        f"{item.source_ref or item.version_id}: {warning}",
-                    )
-                concat_inputs.append(segment)
-                segment_durations.append(segment_duration)
-                if spec.on_element_done is not None:
-                    for element_id in input_element_ids[index]:
-                        remaining_element_occurrences[element_id] -= 1
-                    completed_elements = sum(
-                        remaining == 0
-                        for remaining in remaining_element_occurrences.values()
-                    )
-                    spec.on_element_done(
-                        completed_elements,
-                        total_elements,
-                    )
+                    done_signals += 1
+                    _report_done(index)
+            else:
+                # Segments share no state (each burns its own overlay
+                # stack onto its own file); the only serialized resource
+                # is the capture worker, which queues internally.
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=concurrency,
+                ) as pool:
+                    futures = {
+                        pool.submit(
+                            self._render_one_segment,
+                            spec,
+                            index,
+                            item,
+                            segment_dir=segment_dir,
+                            tail_trims=tail_trims,
+                        ): index
+                        for index, item in enumerate(spec.inputs)
+                    }
+                    try:
+                        for future in concurrent.futures.as_completed(
+                            futures,
+                        ):
+                            index = futures[future]
+                            outcomes[index] = future.result()
+                            done_signals += 1
+                            _report_done(index)
+                    except BaseException:
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        raise
+            del done_signals
+            for index in range(len(spec.inputs)):
+                outcome = outcomes[index]
+                concat_inputs.append(outcome.path)
+                segment_durations.append(outcome.duration)
+                overlay_warnings.extend(outcome.warnings)
         else:
             concat_inputs.extend(item.path for item in spec.inputs)
         joins = self._resolve_segment_joins(spec, joins_by_pair)
@@ -367,7 +504,102 @@ class FfmpegLocalMediaRunner:
                 spec.output_path,
                 work_dir=spec.work_dir,
             )
+        if spec.audio_tracks:
+            self._mix_audio_tracks(spec)
+        grade_warning = self._apply_color_grade(spec)
+        if grade_warning:
+            overlay_warnings.append(grade_warning)
+        loudness_warning = self._normalize_delivery_loudness(spec)
+        if loudness_warning:
+            overlay_warnings.append(loudness_warning)
         return overlay_warnings
+
+    @staticmethod
+    def _snap_transitions_to_beats(
+        spec: LocalMediaExecutionSpec,
+        tail_trims: dict[str, float],
+        joins: dict[tuple[str, str], TransitionJoin],
+    ) -> None:
+        """Beat-sync (WT-B5): land each xfade's resolution moment on a beat.
+
+        The overlap a transition consumes is fixed by the Timeline
+        (blend + tail trim = overlap), but the split between the two is a
+        render-side degree of freedom: shifting δ from trim to blend moves
+        the moment the incoming shot fully takes over (xfade end) by δ
+        while the chain offsets after the join and the total duration stay
+        exactly on the Timeline end. Snapping therefore never retimes the
+        committed cut layout. Requires a BGM track; degradation (no
+        librosa, unreadable audio) is declared in the log, never silent.
+        """
+        if not any(join.effective_blend() > 0 for join in joins.values()):
+            return
+        track = max(
+            (
+                item
+                for item in spec.audio_tracks
+                if item.get("path")
+                and float(item.get("max_duration_seconds") or 0.0) > 0
+            ),
+            key=lambda item: float(item["max_duration_seconds"]),
+            default=None,
+        )
+        if track is None:
+            return
+        try:
+            grid = extract_beat_grid(Path(track["path"]))
+        except BeatGridUnavailable as error:
+            logger.info("转场 beat-sync 跳过（已声明降级）: %s", error)
+            return
+        except Exception as error:  # noqa: BLE001 - snapping is best-effort
+            logger.warning("节拍网格提取失败，转场不吸附: %s", error)
+            return
+        if not grid.beats_ms:
+            return
+        music_offset = float(track.get("offset_seconds") or 0.0)
+        durations: list[float] = []
+        for item in spec.inputs:
+            if item.start_seconds is not None and item.end_seconds is not None:
+                raw = (item.end_seconds - item.start_seconds) / getattr(
+                    item,
+                    "playback_rate",
+                    1.0,
+                )
+            elif item.duration_seconds is not None:
+                raw = item.duration_seconds
+            else:
+                return  # boundaries cannot be predicted — leave unsnapped
+            durations.append(raw - tail_trims.get(item.source_ref, 0.0))
+        accumulated = durations[0]
+        for index in range(1, len(spec.inputs)):
+            pair = (
+                spec.inputs[index - 1].source_ref,
+                spec.inputs[index].source_ref,
+            )
+            join = joins.get(pair)
+            blend = join.effective_blend() if join is not None else 0.0
+            if join is not None and blend > 0:
+                from_ref = pair[0]
+                trim = tail_trims.get(from_ref, 0.0)
+                local_ms = round((accumulated - music_offset) * 1000)
+                delta = (grid.snap_ms(local_ms) - local_ms) / 1000
+                new_blend = blend + delta
+                new_trim = trim - delta
+                if (
+                    delta
+                    and new_trim >= 0
+                    and _MIN_SNAPPED_BLEND_SECONDS
+                    <= new_blend
+                    < min(durations[index - 1], durations[index])
+                ):
+                    tail_trims[from_ref] = new_trim
+                    durations[index - 1] += delta
+                    joins[pair] = TransitionJoin(
+                        kind=join.kind,
+                        blend_seconds=new_blend,
+                    )
+                    accumulated += delta
+                    blend = new_blend
+            accumulated = accumulated - blend + durations[index]
 
     @staticmethod
     def _transition_directives(
@@ -420,6 +652,179 @@ class FfmpegLocalMediaRunner:
             )
             for index in range(1, len(spec.inputs))
         ]
+
+    def _apply_color_grade(
+        self,
+        spec: LocalMediaExecutionSpec,
+    ) -> str | None:
+        """Re-encode the composited cut through one unified grade preset.
+
+        Grading runs last (after concat and audio mixing) so a single
+        deterministic pass colours every segment, transition and burned
+        overlay identically. Unknown preset names degrade to a warning:
+        losing the grade must never lose the cut.
+        """
+
+        grade = (spec.color_grade or "").strip()
+        if not grade:
+            return None
+        video_filter = _COLOR_GRADE_FILTERS.get(grade)
+        if video_filter is None:
+            return f"未知的统一调色预设 {grade!r}，已跳过调色；可用预设: " + ", ".join(
+                sorted(_COLOR_GRADE_FILTERS),
+            )
+        graded = spec.work_dir / "graded.mp4"
+        self._run(
+            [
+                "-y",
+                "-i",
+                os.fspath(spec.output_path),
+                "-vf",
+                video_filter,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                os.fspath(graded),
+            ],
+            cwd=spec.work_dir,
+        )
+        graded.replace(spec.output_path)
+        return None
+
+    def _mix_audio_tracks(self, spec: LocalMediaExecutionSpec) -> None:
+        """Mix Timeline audio Elements into the composed video.
+
+        The video stream is stream-copied; each track is trimmed to its span,
+        gain/pan adjusted, delayed to its Timeline offset, then mixed with the
+        composed video's own audio (when present) without renormalization.
+        Roles keep the three sound layers apart: narration ducks the footage
+        audio under it, bgm plays as one continuous low bed that ducks itself
+        under every speech window (native dialogue, s2v, narration), and sfx
+        mixes verbatim.
+        """
+
+        premix = spec.work_dir / "premix.mp4"
+        os.replace(spec.output_path, premix)
+        arguments: list[str] = ["-y", "-i", os.fspath(premix)]
+        filters: list[str] = []
+        labels: list[str] = []
+        narration_windows: list[tuple[float, float]] = []
+        for track in spec.audio_tracks:
+            # Tracks predating the role key always ducked the footage audio,
+            # i.e. behaved as narration.
+            if str(track.get("role") or "narration") != "narration":
+                continue
+            duration = float(track.get("max_duration_seconds") or 0.0)
+            offset = float(track.get("offset_seconds") or 0.0)
+            if duration > 0:
+                narration_windows.append((offset, offset + duration))
+        bgm_duck_windows = _merge_windows(
+            [*spec.speech_windows, *narration_windows],
+        )
+        for index, track in enumerate(spec.audio_tracks):
+            arguments += ["-i", os.fspath(track["path"])]
+            role = str(track.get("role") or "narration")
+            chain = [f"[{index + 1}:a]aformat=channel_layouts=stereo"]
+            duration = float(track.get("max_duration_seconds") or 0.0)
+            if duration > 0:
+                chain.append(f"atrim=0:{duration:.6f}")
+            # Edge fades on the track-local clock (before adelay). A bgm
+            # bed opens/closes musically instead of cutting in, and two
+            # overlapping bgm spans crossfade: both edges fade while amix
+            # sums them.
+            fade_in = max(0.0, float(track.get("fade_in_seconds") or 0.0))
+            fade_out = max(0.0, float(track.get("fade_out_seconds") or 0.0))
+            if 0 < duration < fade_in + fade_out:
+                scale = duration / (fade_in + fade_out)
+                fade_in *= scale
+                fade_out *= scale
+            if fade_in > 0:
+                chain.append(f"afade=t=in:d={fade_in:.3f}")
+            if fade_out > 0 and duration > 0:
+                chain.append(
+                    f"afade=t=out:st={max(0.0, duration - fade_out):.3f}"
+                    f":d={fade_out:.3f}",
+                )
+            gain = float(track.get("gain_db") or 0.0)
+            if role == "bgm":
+                gain += _BGM_BED_GAIN_DB
+            if gain:
+                chain.append(f"volume={gain:.3f}dB")
+            pan = float(track.get("pan") or 0.0)
+            if pan:
+                left = max(0.0, min(1.0, 1.0 - pan))
+                right = max(0.0, min(1.0, 1.0 + pan))
+                chain.append(
+                    f"pan=stereo|c0={left:.3f}*c0|c1={right:.3f}*c1",
+                )
+            offset = float(track.get("offset_seconds") or 0.0)
+            delay_ms = int(round(offset * 1000))
+            if delay_ms > 0:
+                chain.append(f"adelay={delay_ms}:all=1")
+            if role == "bgm":
+                # After adelay, filter time equals absolute timeline time,
+                # matching the speech windows.
+                for start, end in bgm_duck_windows:
+                    chain.append(
+                        f"volume={_BGM_DUCK_VOLUME}:enable="
+                        f"'between(t,{start:.3f},{end:.3f})'",
+                    )
+            label = f"[mix{index}]"
+            filters.append(",".join(chain) + label)
+            labels.append(label)
+        if self._probe_has_audio(premix):
+            base_chain = ["[0:a]aformat=channel_layouts=stereo"]
+            for start, end in _merge_windows(narration_windows):
+                base_chain.append(
+                    f"volume={_DUCK_VOLUME}:enable="
+                    f"'between(t,{start:.3f},{end:.3f})'",
+                )
+            filters.append(",".join(base_chain) + "[base]")
+            labels.insert(0, "[base]")
+        if len(labels) == 1:
+            mixed = labels[0]
+        else:
+            filters.append(
+                f"{''.join(labels)}amix=inputs={len(labels)}"
+                ":duration=longest:normalize=0[aout]",
+            )
+            mixed = "[aout]"
+        # Cap audio at the composed video duration so a long narration cannot
+        # extend the container past the final frame.
+        final_label = mixed
+        if spec.expected_duration_seconds:
+            filters.append(
+                f"{mixed}atrim=0:{spec.expected_duration_seconds:.6f}[afinal]",
+            )
+            final_label = "[afinal]"
+        self._run(
+            [
+                *arguments,
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "0:v",
+                "-map",
+                final_label,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                os.fspath(spec.output_path),
+            ],
+            cwd=spec.work_dir,
+        )
 
     def _probe_has_audio(self, path: Path) -> bool:
         try:
@@ -526,6 +931,10 @@ class FfmpegLocalMediaRunner:
         *,
         canvas_size: tuple[int, int],
         duration_seconds: float,
+        freeze_duration: float = 0.0,
+        freeze_audio: bool = False,
+        playback_rate: float = 1.0,
+        retime_audio: bool = False,
     ) -> str:
         """Build one anchor-based placement graph shared with the UI preview."""
 
@@ -566,72 +975,660 @@ class FfmpegLocalMediaRunner:
         )
         overlay_x = round(location["x"] * canvas_width - rotated_width / 2)
         overlay_y = round(location["y"] * canvas_height - rotated_height / 2)
-        return (
-            f"[0:v]scale={box_width}:{box_height}:force_original_aspect_ratio=increase,"
+
+        # Build the video filter chain
+        video_filters = (
+            f"[0:v]setpts=(PTS-STARTPTS)/{playback_rate:.12g},"
+            f"scale={box_width}:{box_height}:force_original_aspect_ratio=increase,"
             f"crop={box_width}:{box_height},setsar=1,format=rgba,"
             f"colorchannelmixer=aa={location['opacity']:.6f},"
             f"pad={padded_width}:{padded_height}:{pad_x}:{pad_y}:color=0x00000000,"
             f"rotate={location['rotation_degrees']:.6f}*PI/180:"
-            f"ow={rotated_width}:oh={rotated_height}:c=none[fg];"
+            f"ow={rotated_width}:oh={rotated_height}:c=none"
+        )
+
+        # Add tpad filter to freeze the last frame if needed
+        if freeze_duration > 0:
+            video_filters += (
+                f",tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}"
+            )
+
+        video_filters += "[fg]"
+
+        # Build the filter chain
+        filter_chain = (
+            f"{video_filters};"
             f"color=c=black:s={canvas_width}x{canvas_height}:r=30:"
             f"d={duration_seconds:.6f}[bg];"
             f"[bg][fg]overlay={overlay_x}:{overlay_y}:shortest=1,format=yuv420p[outv]"
         )
 
+        # Keep source sound in sync with the retimed picture. ``atempo``
+        # historically accepts factors only in [0.5, 2], so decompose more
+        # extreme rates into a stable chain instead of rejecting a Project
+        # value that already passed schema validation.
+        if retime_audio or freeze_audio:
+            audio_filters = (
+                cls._atempo_filters(playback_rate) if retime_audio else []
+            )
+            if freeze_audio:
+                audio_filters.append(f"apad=pad_dur={freeze_duration:.6f}")
+            filter_chain += f";[0:a]{','.join(audio_filters)}[a]"
+
+        return filter_chain
+
+    @staticmethod
+    def _atempo_filters(playback_rate: float) -> list[str]:
+        """Return an ffmpeg atempo chain whose factors multiply to rate."""
+
+        if not math.isfinite(playback_rate) or playback_rate <= 0:
+            raise ValueError(
+                "playback_rate must be finite and greater than zero",
+            )
+        remaining = playback_rate
+        factors: list[float] = []
+        while remaining < 0.5:
+            if len(factors) >= 64:
+                raise ValueError(
+                    "playback_rate exceeds the supported audio retiming range",
+                )
+            factors.append(0.5)
+            remaining /= 0.5
+        while remaining > 2.0:
+            if len(factors) >= 64:
+                raise ValueError(
+                    "playback_rate exceeds the supported audio retiming range",
+                )
+            factors.append(2.0)
+            remaining /= 2.0
+        factors.append(remaining)
+        return [f"atempo={factor:.12g}" for factor in factors]
+
+    def _segment_concurrency(self, segment_count: int) -> int:
+        """Parallel segment renders for one composition.
+
+        Segments are independent (each owns its file and overlay stack);
+        the ceiling keeps Chromium + ffmpeg peak memory bounded on a
+        developer machine.  ``QWENPAW_SEGMENT_CONCURRENCY=1`` restores
+        strictly serial rendering.
+        """
+
+        raw = os.environ.get("QWENPAW_SEGMENT_CONCURRENCY", "")
+        try:
+            configured = int(raw) if raw else 3
+        except ValueError:
+            configured = 3
+        return max(1, min(configured, segment_count, os.cpu_count() or 1))
+
+    def _segment_cache_key(
+        self,
+        spec: LocalMediaExecutionSpec,
+        item: LocalMediaInput,
+        *,
+        segment_duration: float,
+        freeze_duration: float,
+    ) -> str | None:
+        """Content identity of one finished (base + burned layers) segment.
+
+        Every input that can change the segment's pixels or sound must
+        appear here; the checksum identifies source bytes, motion/overlay
+        projections identify burned layers by document checksum, and the
+        engine digest salts the html_js frame renderer.  Returns ``None``
+        when the item carries no stable content checksum.
+        """
+
+        if not item.checksum:
+            return None
+        try:
+            payload = {
+                "v": _SEGMENT_CACHE_VERSION,
+                "checksum": item.checksum,
+                "mediaType": item.media_type,
+                "start": item.start_seconds,
+                "end": item.end_seconds,
+                "playbackRate": item.playback_rate,
+                "sourceDuration": item.duration_seconds,
+                "segmentDuration": round(segment_duration, 6),
+                "freeze": round(freeze_duration, 6),
+                "canvas": list(spec.canvas_size),
+                "location": item.location,
+                "originalSound": item.original_sound,
+                "overlays": [
+                    _fingerprint_overlay(overlay) for overlay in item.overlays
+                ],
+                "motions": [
+                    _fingerprint_motion(motion) for motion in item.motions
+                ],
+                "motionClip": (
+                    _fingerprint_motion(item.motion_clip)
+                    if item.motion_clip is not None
+                    else None
+                ),
+                "engine": full_engine_digest(),
+            }
+            return hashlib.sha256(
+                canonical_json_bytes(payload),
+            ).hexdigest()
+        except Exception:  # noqa: BLE001 - cache is best-effort only
+            return None
+
+    @staticmethod
+    def _segment_cache_root() -> Path:
+        root = Path(tempfile.gettempdir()) / "qwenpaw-segment-cache-v1"
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return root
+
+    def _restore_cached_segment(
+        self,
+        cache_key: str,
+        segment: Path,
+    ) -> tuple[str, ...] | None:
+        """Copy one cached segment into place; returns its warnings."""
+
+        entry = self._segment_cache_root() / f"{cache_key}.mp4"
+        sidecar = entry.with_suffix(".json")
+        if not entry.is_file():
+            return None
+        try:
+            shutil.copy2(entry, segment)
+            warnings: tuple[str, ...] = ()
+            if sidecar.is_file():
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+                warnings = tuple(str(w) for w in (data.get("warnings") or []))
+            entry.touch()  # LRU recency
+            return warnings
+        except Exception:  # noqa: BLE001 - fall back to a fresh render
+            return None
+
+    def _store_cached_segment(
+        self,
+        cache_key: str,
+        segment: Path,
+        warnings: Sequence[str],
+    ) -> None:
+        root = self._segment_cache_root()
+        entry = root / f"{cache_key}.mp4"
+        try:
+            staged = entry.with_name(f"{entry.stem}.{os.getpid()}.tmp")
+            shutil.copy2(segment, staged)
+            staged.replace(entry)
+            entry.with_suffix(".json").write_text(
+                json.dumps({"warnings": list(warnings)}),
+                encoding="utf-8",
+            )
+            self._prune_segment_cache(root)
+        except Exception:  # noqa: BLE001 - cache is best-effort only
+            return
+
+    @staticmethod
+    def _prune_segment_cache(root: Path) -> None:
+        entries = sorted(
+            root.glob("*.mp4"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in entries[_SEGMENT_CACHE_MAX_ITEMS:]:
+            stale.unlink(missing_ok=True)
+            stale.with_suffix(".json").unlink(missing_ok=True)
+
+    def _render_one_segment(
+        self,
+        spec: LocalMediaExecutionSpec,
+        index: int,
+        item: LocalMediaInput,
+        *,
+        segment_dir: Path,
+        tail_trims: Mapping[str, float],
+    ) -> _SegmentRender:
+        """Render one timeline segment: base picture plus burned layers."""
+
+        start_seconds = item.start_seconds or 0.0
+        end_seconds = item.end_seconds
+        if end_seconds is None:
+            if item.duration_seconds is None:
+                raise ValidationError(
+                    "Edit Element 缺少可执行 source range",
+                )
+            end_seconds = start_seconds + item.duration_seconds
+        source_window_seconds = end_seconds - start_seconds
+        rendered_window_seconds = source_window_seconds / item.playback_rate
+        # For a transition pair, the tail of the `from` segment that
+        # the `to` segment covers is simply not rendered; the rest of
+        # the overlap is consumed by the xfade blend.
+        tail_trim = tail_trims.get(item.source_ref, 0.0)
+        segment_duration = max(
+            1 / 30,
+            rendered_window_seconds - tail_trim,
+        )
+
+        # ``-t`` is an input-side source range while ``tail_trim`` is in
+        # rendered Timeline time. Convert the latter back to source time;
+        # otherwise slow clips are cut to their raw duration and fast clips
+        # do not read enough frames.
+        source_read_duration = max(
+            item.playback_rate / 30,
+            source_window_seconds - tail_trim * item.playback_rate,
+        )
+
+        # Calculate freeze duration if target exceeds source
+        freeze_duration = 0.0
+        if (
+            item.duration_seconds is not None
+            and item.start_seconds is not None
+            and item.end_seconds is not None
+        ):
+            available_source_duration = max(
+                0.0,
+                item.duration_seconds - start_seconds,
+            )
+            available_rendered_duration = (
+                min(source_read_duration, available_source_duration)
+                / item.playback_rate
+            )
+            if segment_duration > available_rendered_duration:
+                freeze_duration = (
+                    segment_duration - available_rendered_duration
+                )
+
+        segment = segment_dir / f"{index:06d}.mp4"
+        cache_key = self._segment_cache_key(
+            spec,
+            item,
+            segment_duration=segment_duration,
+            freeze_duration=freeze_duration,
+        )
+        if cache_key is not None:
+            cached_warnings = self._restore_cached_segment(cache_key, segment)
+            if cached_warnings is not None:
+                return _SegmentRender(
+                    segment,
+                    segment_duration,
+                    cached_warnings,
+                )
+
+        warnings: list[str] = []
+        if item.motion_clip is not None:
+            # A pure motion-graphics segment: the document paints
+            # the whole picture, so the base is a silent opaque
+            # canvas and the clip renders full-frame on top.
+            self._render_motion_clip_segment(
+                item,
+                segment,
+                canvas_size=spec.canvas_size,
+                segment_duration=segment_duration,
+                work_dir=spec.work_dir,
+            )
+        else:
+            # A still image can carry a segment (pure motion-graphics
+            # cuts render generated backdrops with overlays on top).
+            # ffmpeg needs -loop 1 to keep emitting frames and -t to
+            # bound the loop; seeking into a still is meaningless.
+            is_still_image = item.duration_seconds is None and str(
+                item.media_type or "",
+            ).startswith("image/")
+            # apad references [0:a]; sources without an audio stream
+            # (common for generated R2V footage) must keep the optional
+            # 0:a? mapping or ffmpeg rejects the whole filtergraph.
+            has_audio = not is_still_image and self._probe_has_audio(item.path)
+            freeze_audio = freeze_duration > 0 and has_audio
+            retime_audio = item.playback_rate != 1.0 and has_audio
+            placement_filter = self._placement_filter(
+                item.location,
+                canvas_size=spec.canvas_size,
+                duration_seconds=segment_duration,
+                freeze_duration=freeze_duration,
+                freeze_audio=freeze_audio,
+                playback_rate=item.playback_rate,
+                retime_audio=retime_audio,
+            )
+
+            # Build FFmpeg arguments
+            if is_still_image:
+                ffmpeg_args = [
+                    "-y",
+                    "-loop",
+                    "1",
+                    "-framerate",
+                    "30",
+                    "-t",
+                    f"{source_read_duration:.6f}",
+                    "-i",
+                    os.fspath(item.path),
+                ]
+            else:
+                ffmpeg_args = [
+                    "-y",
+                    "-ss",
+                    f"{start_seconds:.6f}",
+                    "-t",
+                    f"{source_read_duration:.6f}",
+                    "-i",
+                    os.fspath(item.path),
+                ]
+            ffmpeg_args.extend(
+                [
+                    "-filter_complex",
+                    placement_filter,
+                    "-map",
+                    "[outv]",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ],
+            )
+
+            # Map audio if present
+            if freeze_audio or retime_audio:
+                ffmpeg_args.extend(["-map", "[a]"])
+            else:
+                ffmpeg_args.extend(["-map", "0:a?"])
+
+            ffmpeg_args.extend(
+                [
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    os.fspath(segment),
+                ],
+            )
+
+            self._run(ffmpeg_args, cwd=spec.work_dir)
+        # Text-free motion layers (variety frames, decorations) burn
+        # first; caption cards burn on top so copy stays readable even
+        # when a frame border crosses the caption box (variety-show
+        # packaging puts 花字 on the frame, never under it).
+        for warning in self._apply_motion_overlays(item, segment):
+            warnings.append(
+                f"{item.source_ref or item.version_id}: {warning}",
+            )
+        for warning in self._apply_overlay(item, segment):
+            warnings.append(
+                f"{item.source_ref or item.version_id}: {warning}",
+            )
+        if cache_key is not None:
+            self._store_cached_segment(cache_key, segment, warnings)
+        return _SegmentRender(segment, segment_duration, tuple(warnings))
+
     def _apply_overlay(
         self,
         item: LocalMediaInput,
         segment: Path,
-    ) -> str | None:
-        overlay = self._normalized_overlay(item)
-        if overlay is None:
-            return None
-        video_size = self._probe_video_size(segment)
+    ) -> list[str]:
+        """Burn every text overlay into one prepared segment.
+
+        Overlays are applied sequentially; each reads the segment produced by
+        the previous one so they stack in z_index order.
+        """
+        warnings: list[str] = []
+        segment_duration = (
+            (item.end_seconds - item.start_seconds) / item.playback_rate
+            if item.start_seconds is not None and item.end_seconds is not None
+            else item.duration_seconds
+        )
+        video_size: tuple[int, int] | None = None
+        # Motion layers queue up and burn in one ffmpeg pass per batch, so
+        # N captions cost one encode generation instead of N sequential
+        # re-encodes.  A fixed-style fallback flushes the queue first so
+        # stacking keeps strict z_index order.
+        pending: list[
+            tuple[
+                PreparedMotionLayer,
+                str | None,
+                Mapping[str, Any],
+                Mapping[str, Any] | None,
+            ]
+        ] = []
+
+        def flush_pending() -> None:
+            queue = list(pending)
+            pending.clear()
+            for start in range(0, len(queue), _MOTION_BURN_BATCH_SIZE):
+                batch = queue[start : start + _MOTION_BURN_BATCH_SIZE]
+                burned = segment.with_name(f"{segment.stem}-overlay.mp4")
+                result = composite_motion_layers(
+                    ffmpeg_path=self.executable,
+                    input_path=segment,
+                    output_path=burned,
+                    layers=[layer for layer, _, _, _ in batch],
+                )
+                if result.success:
+                    os.replace(burned, segment)
+                    warnings.extend(err for _, err, _, _ in batch if err)
+                    continue
+                burned.unlink(missing_ok=True)
+                # Degraded path: burn one by one so a single bad layer
+                # cannot sink its whole batch; a still-failing layer drops
+                # to the fixed style so caption copy never leaves the cut.
+                for layer, err, fb_overlay, fb_location in batch:
+                    single = composite_motion_layers(
+                        ffmpeg_path=self.executable,
+                        input_path=segment,
+                        output_path=burned,
+                        layers=[layer],
+                    )
+                    if single.success:
+                        os.replace(burned, segment)
+                        if err is not None:
+                            warnings.append(err)
+                        continue
+                    burned.unlink(missing_ok=True)
+                    self._burn_fixed_overlay(
+                        fb_overlay,
+                        segment,
+                        video_size or self._probe_video_size(segment),
+                        warnings,
+                        f"{fb_overlay['kind']} 动效层合成失败，已回退固定样式: "
+                        f"{single.error or '未知错误'}",
+                        fb_location,
+                    )
+
+        for raw in item.overlays:
+            overlay = self._normalized_overlay(raw, segment_duration)
+            if overlay is None:
+                continue
+            if video_size is None:
+                video_size = self._probe_video_size(segment)
+            styled_error: str | None = None
+            motion = overlay.get("motion")
+            render_location = overlay.get("location")
+            using_safe_motion = False
+            if (
+                isinstance(motion, Mapping)
+                and str(motion.get("html") or "").strip()
+                and not _motion_document_matches_text(
+                    str(motion["html"]),
+                    str(overlay.get("text") or ""),
+                )
+            ):
+                motion = None
+                styled_error = (
+                    f"{overlay['kind']} 动效文档与当前文案不一致，" "已用回退样式渲染最新文案"
+                )
+            if (
+                isinstance(motion, Mapping)
+                and str(motion.get("html") or "").strip()
+            ):
+                safety_error = caption_layout_error(
+                    render_location,
+                    str(overlay.get("text") or ""),
+                    video_size,
+                )
+                if safety_error is None:
+                    location = render_location
+                    width_ratio = (
+                        float(location.get("width", 1.0))
+                        if isinstance(location, Mapping)
+                        else 1.0
+                    )
+                    height_ratio = (
+                        float(location.get("height", 1.0))
+                        if isinstance(location, Mapping)
+                        else 1.0
+                    )
+                    probe = probe_motion_document(
+                        str(motion["html"]),
+                        doc_format=str(motion.get("format") or "html_css"),
+                        box_width=max(160, round(video_size[0] * width_ratio)),
+                        box_height=max(
+                            90,
+                            round(video_size[1] * height_ratio),
+                        ),
+                        ffmpeg_path=self.executable,
+                    )
+                    if not probe.ok:
+                        safety_error = probe.error
+                    elif probe.edge_contact > 1.0:
+                        safety_error = "字幕卡内容触碰视口边缘，存在裁切风险"
+                    elif probe.text_occlusion > 0.10:
+                        safety_error = "字幕文字被卡片内的图标或装饰遮挡"
+                if safety_error is not None:
+                    fallback_w = (
+                        float(render_location.get("width", 0.8))
+                        if isinstance(render_location, Mapping)
+                        else 0.8
+                    )
+                    fallback_h = (
+                        float(render_location.get("height", 0.25))
+                        if isinstance(render_location, Mapping)
+                        else 0.25
+                    )
+                    render_location = {
+                        "x": 0.5,
+                        "y": 0.88,
+                        "width": 0.8,
+                        "height": 0.25,
+                        "anchor_x": 0.5,
+                        "anchor_y": 0.5,
+                        "opacity": 1.0,
+                    }
+                    motion = {
+                        "html": render_caption_template(
+                            str(overlay.get("text") or ""),
+                            emotion=str(overlay.get("vibe") or "chill"),
+                            box_width=fallback_w,
+                            box_height=fallback_h,
+                        ),
+                        "fps": 24,
+                        "loop": False,
+                    }
+                    using_safe_motion = True
+                    styled_error = (
+                        f"{overlay['kind']} 字幕动效未通过合成安全检查，"
+                        f"已用统一安全动效模板渲染: {safety_error}"
+                    )
+            if (
+                isinstance(motion, Mapping)
+                and str(motion.get("html") or "").strip()
+            ):
+                prep = prepare_motion_layer(
+                    ffmpeg_path=self.executable,
+                    html=str(motion["html"]),
+                    fps=min(60, max(8, int(motion.get("fps") or 24))),
+                    loop=bool(motion.get("loop", True)),
+                    video_size=video_size,
+                    appear_at=overlay["appear_at"],
+                    duration=overlay["duration"],
+                    location=render_location,
+                    viewport_inset=0.05,
+                    doc_format=str(motion.get("format") or "html_css"),
+                    # Caption cards may bleed background blocks off their
+                    # box on purpose; readability is guarded by the
+                    # design-time layout/occlusion/copy gates instead.
+                    max_edge_contact=1.0,
+                )
+                if prep.layer is not None:
+                    pending.append(
+                        (prep.layer, styled_error, overlay, render_location),
+                    )
+                    continue
+                if not using_safe_motion:
+                    generated_error = prep.error or "未知错误"
+                    fallback_w = (
+                        float(render_location.get("width", 0.8))
+                        if isinstance(render_location, Mapping)
+                        else 0.8
+                    )
+                    fallback_h = (
+                        float(render_location.get("height", 0.25))
+                        if isinstance(render_location, Mapping)
+                        else 0.25
+                    )
+                    render_location = {
+                        "x": 0.5,
+                        "y": 0.88,
+                        "width": 0.8,
+                        "height": 0.25,
+                        "anchor_x": 0.5,
+                        "anchor_y": 0.5,
+                        "opacity": 1.0,
+                    }
+                    safe_prep = prepare_motion_layer(
+                        ffmpeg_path=self.executable,
+                        html=render_caption_template(
+                            str(overlay.get("text") or ""),
+                            emotion=str(overlay.get("vibe") or "chill"),
+                            box_width=fallback_w,
+                            box_height=fallback_h,
+                        ),
+                        fps=24,
+                        loop=False,
+                        video_size=video_size,
+                        appear_at=overlay["appear_at"],
+                        duration=overlay["duration"],
+                        location=render_location,
+                        viewport_inset=0.05,
+                    )
+                    if safe_prep.layer is not None:
+                        pending.append(
+                            (
+                                safe_prep.layer,
+                                f"{overlay['kind']} 生成样式渲染失败，"
+                                f"已用统一安全动效模板渲染: {generated_error}",
+                                overlay,
+                                render_location,
+                            ),
+                        )
+                        continue
+                    styled_error = (
+                        f"{overlay['kind']} 生成样式与安全动效模板均渲染失败，"
+                        "已回退固定样式: "
+                        f"{generated_error}; {safe_prep.error or '未知错误'}"
+                    )
+                else:
+                    styled_error = (
+                        f"{overlay['kind']} 安全动效模板渲染失败，"
+                        f"已回退固定样式: {prep.error or '未知错误'}"
+                    )
+            # The fixed style stacks below any queued motion layers unless
+            # the queue burns first, so flush before painting it.
+            flush_pending()
+            self._burn_fixed_overlay(
+                overlay,
+                segment,
+                video_size,
+                warnings,
+                styled_error,
+                render_location,
+            )
+        flush_pending()
+        return warnings
+
+    def _burn_fixed_overlay(
+        self,
+        overlay: Mapping[str, Any],
+        segment: Path,
+        video_size: tuple[int, int],
+        warnings: list[str],
+        styled_error: str | None,
+        render_location: Mapping[str, Any] | None,
+    ) -> None:
+        """Burn one fixed-style caption; failure aborts the composition."""
+
         rendered = segment.with_name(f"{segment.stem}-overlay.mp4")
-        styled_error: str | None = None
-        motion = overlay.get("motion")
-        if (
-            isinstance(motion, Mapping)
-            and str(motion.get("html") or "").strip()
-            and not _motion_document_matches_text(
-                str(motion["html"]),
-                str(overlay.get("text") or ""),
-            )
-        ):
-            # The copy changed but the motion document is stale: skip the
-            # outdated document and burn the current copy in via the fallback
-            # template. Never ship stale copy to the user.
-            motion = None
-            styled_error = f"{overlay['kind']} 动效文档与当前文案不一致，" "已用回退样式渲染最新文案"
-        if (
-            isinstance(motion, Mapping)
-            and str(motion.get("html") or "").strip()
-        ):
-            # A text overlay carrying a generated motion document renders
-            # through the deterministic motion pipeline; the procedural
-            # template below stays as the fallback so the required text
-            # bubble never silently disappears.
-            result = render_motion_overlay(
-                ffmpeg_path=self.executable,
-                input_path=segment,
-                output_path=rendered,
-                html=str(motion["html"]),
-                fps=min(60, max(8, int(motion.get("fps") or 24))),
-                loop=bool(motion.get("loop", True)),
-                video_size=video_size,
-                appear_at=overlay["appear_at"],
-                duration=overlay["duration"],
-                location=overlay.get("location"),
-                viewport_inset=0.05,
-            )
-            if result.success:
-                os.replace(rendered, segment)
-                return None
-            rendered.unlink(missing_ok=True)
-            styled_error = (
-                f"{overlay['kind']} 生成样式渲染失败，已回退固定样式: "
-                f"{result.error or '未知错误'}"
-            )
         if overlay["kind"] == "pet_os":
             result = render_pet_os_overlay(
                 ffmpeg_path=self.executable,
@@ -642,9 +1639,12 @@ class FfmpegLocalMediaRunner:
                 video_size=video_size,
                 appear_at=overlay["appear_at"],
                 duration=overlay["duration"],
-                location=overlay.get("location"),
+                location=render_location,
             )
         else:
+            # Interview-summary card styling: reached by legacy inputs
+            # frozen before overlay kinds were removed and by overlays
+            # whose migrated presentation is vibe="summary".
             result = render_interview_summary_overlay(
                 ffmpeg_path=self.executable,
                 input_path=segment,
@@ -657,9 +1657,17 @@ class FfmpegLocalMediaRunner:
             )
         if not result.success:
             rendered.unlink(missing_ok=True)
-            return result.error or f"{overlay['kind']} overlay 渲染失败"
+            # The fixed template is the last carrier of the caption
+            # copy: when it fails too, the final cut would silently
+            # lose mandatory content, so the execution aborts and the
+            # task fails into the rejection feedback loop.
+            raise ValidationError(
+                f"{overlay['kind']} 字幕渲染失败，已中止合成（台词内容不得从成片中"
+                f"丢失）: {result.error or '未知错误'}",
+            )
         os.replace(rendered, segment)
-        return styled_error
+        if styled_error is not None:
+            warnings.append(styled_error)
 
     def _apply_motion_overlays(
         self,
@@ -668,25 +1676,24 @@ class FfmpegLocalMediaRunner:
     ) -> list[str]:
         """Burn every generated motion overlay into one prepared segment.
 
-        Motion overlays are additive polish: a failed document only records a
-        warning so the edit itself still completes.
+        A failed decoration has no fallback rendering: shipping the
+        segment anyway would silently publish a final cut that lacks a
+        committed overlay. The render error aborts the whole execution so
+        the task fails and the rejection feedback loop can regenerate or
+        drop the design instead.
         """
 
         warnings: list[str] = []
         video_size: tuple[int, int] | None = None
-        for index, motion in enumerate(item.motions):
+        layers: list[PreparedMotionLayer] = []
+        for motion in item.motions:
             normalized = self._normalized_motion(item, motion)
             if normalized is None:
                 continue
             if video_size is None:
                 video_size = self._probe_video_size(segment)
-            rendered = segment.with_name(
-                f"{segment.stem}-motion-{index:02d}.mp4",
-            )
-            result = render_motion_overlay(
+            prep = prepare_motion_layer(
                 ffmpeg_path=self.executable,
-                input_path=segment,
-                output_path=rendered,
                 html=normalized["html"],
                 fps=normalized["fps"],
                 loop=normalized["loop"],
@@ -695,16 +1702,100 @@ class FfmpegLocalMediaRunner:
                 duration=normalized["duration"],
                 location=normalized.get("location"),
                 viewport_inset=0.05,
+                doc_format=normalized["format"],
+                max_edge_contact=1.0,
+            )
+            if prep.layer is None:
+                raise ValidationError(
+                    f"motion overlay {normalized['element_id']} 渲染失败，"
+                    "已中止合成（不发布缺少既定动效的成片）；请修复或移除该动效 "
+                    f"Element 后重新合成: {prep.error or '未知错误'}",
+                )
+            layers.append(prep.layer)
+        for start in range(0, len(layers), _MOTION_BURN_BATCH_SIZE):
+            batch = layers[start : start + _MOTION_BURN_BATCH_SIZE]
+            rendered = segment.with_name(f"{segment.stem}-motion.mp4")
+            result = composite_motion_layers(
+                ffmpeg_path=self.executable,
+                input_path=segment,
+                output_path=rendered,
+                layers=batch,
             )
             if not result.success:
                 rendered.unlink(missing_ok=True)
-                warnings.append(
-                    f"motion overlay {normalized['element_id']} 渲染失败: "
-                    f"{result.error or '未知错误'}",
+                raise ValidationError(
+                    "motion overlay 合成失败，已中止合成（不发布缺少既定动效的"
+                    f"成片）: {result.error or '未知错误'}",
                 )
-                continue
             os.replace(rendered, segment)
         return warnings
+
+    def _render_motion_clip_segment(
+        self,
+        item: LocalMediaInput,
+        segment: Path,
+        *,
+        canvas_size: tuple[int, int],
+        segment_duration: float,
+        work_dir: Path,
+    ) -> None:
+        """Rasterize one full-canvas motion document into a segment.
+
+        The document paints the segment's whole picture, so a failed
+        render aborts the execution: unlike a lost decoration there is
+        no base footage to fall back to.
+        """
+
+        payload = item.motion_clip
+        assert payload is not None
+        html = str(payload.get("html") or "")
+        if not html.strip():
+            raise ValidationError(
+                f"动效片段 {item.source_ref} 的文档为空，无法合成",
+            )
+        width, height = canvas_size
+        base_args = [
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            (
+                f"color=c=black:s={width}x{height}:r=30"
+                f":d={segment_duration:.6f}"
+            ),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            os.fspath(segment),
+        ]
+        self._run(base_args, cwd=work_dir)
+        rendered = segment.with_name(f"{segment.stem}-clip.mp4")
+        result = render_motion_overlay(
+            ffmpeg_path=self.executable,
+            input_path=segment,
+            output_path=rendered,
+            html=html,
+            fps=int(payload.get("fps") or 24),
+            loop=bool(payload.get("loop", True)),
+            video_size=canvas_size,
+            appear_at=0.0,
+            duration=segment_duration,
+            location=None,
+            doc_format=str(payload.get("format") or "html_css"),
+            full_canvas=True,
+        )
+        if not result.success:
+            rendered.unlink(missing_ok=True)
+            raise ValidationError(
+                f"动效片段 {item.source_ref} 渲染失败，已中止合成（纯动效片段没有可回退的"
+                f"底层画面）: {result.error or '未知错误'}",
+            )
+        os.replace(rendered, segment)
 
     @staticmethod
     def _normalized_motion(
@@ -723,7 +1814,7 @@ class FfmpegLocalMediaRunner:
         ):
             return None
         segment_duration = (
-            item.end_seconds - item.start_seconds
+            (item.end_seconds - item.start_seconds) / item.playback_rate
             if item.start_seconds is not None and item.end_seconds is not None
             else item.duration_seconds
         )
@@ -745,6 +1836,13 @@ class FfmpegLocalMediaRunner:
         if not math.isfinite(duration) or duration <= 0:
             duration = segment_duration - appear_at
         duration = min(duration, segment_duration - appear_at)
+        # A cross-boundary overlay leaves only a sliver of itself on this
+        # segment (transitions shift the cut points); an entrance animation
+        # is still transparent there, so the truth gate would reject the
+        # whole composite over frames nobody can see. Skip the sliver — the
+        # neighbouring segment renders the overlay in full.
+        if duration < 0.3:
+            return None
         try:
             fps = int(raw.get("fps", 24))
         except (TypeError, ValueError):
@@ -752,6 +1850,7 @@ class FfmpegLocalMediaRunner:
         return {
             "element_id": str(raw.get("element_id") or ""),
             "html": html,
+            "format": str(raw.get("format") or "html_css"),
             "fps": min(60, max(8, fps)),
             "loop": bool(raw.get("loop", True)),
             "appear_at": appear_at,
@@ -764,19 +1863,16 @@ class FfmpegLocalMediaRunner:
         }
 
     @staticmethod
-    def _normalized_overlay(item: LocalMediaInput) -> dict[str, Any] | None:
-        raw = item.overlay
+    def _normalized_overlay(
+        raw: Mapping[str, Any] | None,
+        segment_duration: float | None,
+    ) -> dict[str, Any] | None:
         if not isinstance(raw, Mapping):
             return None
         kind = str(raw.get("kind") or "").strip().casefold()
         text = str(raw.get("text") or "").strip()
         if kind not in {"pet_os", "interview_summary"} or not text:
             return None
-        segment_duration = (
-            item.end_seconds - item.start_seconds
-            if item.start_seconds is not None and item.end_seconds is not None
-            else item.duration_seconds
-        )
         if segment_duration is None or not math.isfinite(segment_duration):
             return None
         try:
@@ -829,6 +1925,15 @@ class FfmpegLocalMediaRunner:
 
     @staticmethod
     def _validate_supported_directives(spec: LocalMediaExecutionSpec) -> None:
+        invalid_rates = [
+            item.playback_rate
+            for item in spec.inputs
+            if not math.isfinite(item.playback_rate) or item.playback_rate <= 0
+        ]
+        if invalid_rates:
+            raise ValidationError(
+                "默认 ffmpeg runner 要求 playback_rate 是有限正数",
+            )
         unsupported_transitions: list[str] = []
         for transition in spec.transitions:
             kind = str(transition.get("kind") or "cut").strip().casefold()
@@ -876,7 +1981,7 @@ class FfmpegLocalMediaRunner:
             # the note in the log instead.
             logger.warning(
                 "默认 ffmpeg runner 忽略自由文本 audio_plan（保留原声）: %s",
-                str(spec.audio_plan).strip(),
+                _log_safe(str(spec.audio_plan).strip()),
             )
 
     def _concat(
@@ -891,6 +1996,83 @@ class FfmpegLocalMediaRunner:
             "".join(f"file '{_ffconcat_path(path)}'\n" for path in inputs),
             encoding="utf-8",
         )
+        # Segment AAC frame grids never line up exactly with their video
+        # duration, so stream-copying audio through the concat demuxer
+        # leaves sub-frame gaps at every joint. The mp4 muxer stretches
+        # the packet before each gap to cover it, and browsers abort
+        # decoding on such oversized packets — every seek past the first
+        # joint then hangs. Video packets are unaffected and stay copied;
+        # audio is re-concatenated from the decoded segments instead.
+        audio_flags = [self._probe_has_audio(path) for path in inputs]
+        if any(audio_flags):
+            audio_labels: list[str] = []
+            filter_parts: list[str] = []
+            for index, (path, has_audio) in enumerate(
+                zip(inputs, audio_flags),
+            ):
+                if has_audio:
+                    # Adjacent generated clips carry unrelated ambiences; a
+                    # short edge fade per segment softens the step at every
+                    # hard cut without consuming timeline duration. The fade
+                    # needs the real duration: afade t=out holds zero gain
+                    # after its window, so a wrong (sentinel) duration would
+                    # mute the rest of the segment. Unknown duration or a
+                    # micro-clip (where the ramps would eat the audio)
+                    # passes through unfaded instead.
+                    duration = self._probe_duration_seconds_or_none(path)
+                    if duration is not None and duration >= 0.3:
+                        fade = min(0.04, duration / 4)
+                        filter_parts.append(
+                            f"[{index + 1}:a]afade=t=in:d={fade:.3f},"
+                            f"afade=t=out:st={max(0.0, duration - fade):.3f}"
+                            f":d={fade:.3f}[fade{index}]",
+                        )
+                        audio_labels.append(f"[fade{index}]")
+                    else:
+                        audio_labels.append(f"[{index + 1}:a]")
+                    continue
+                duration = self._probe_duration_seconds(path)
+                filter_parts.append(
+                    "anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    f"atrim=duration={duration:.6f}[silent{index}]",
+                )
+                audio_labels.append(f"[silent{index}]")
+            filter_parts.append(
+                "".join(audio_labels)
+                + f"concat=n={len(inputs)}:v=0:a=1,"
+                + "aresample=async=1:first_pts=0[outa]",
+            )
+            self._run(
+                [
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    os.fspath(manifest),
+                    *(
+                        argument
+                        for path in inputs
+                        for argument in ("-i", os.fspath(path))
+                    ),
+                    "-filter_complex",
+                    ";".join(filter_parts),
+                    "-map",
+                    "0:v",
+                    "-c:v",
+                    "copy",
+                    "-map",
+                    "[outa]",
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    os.fspath(output),
+                ],
+                cwd=work_dir,
+            )
+            return
         self._run(
             [
                 "-y",
@@ -909,7 +2091,154 @@ class FfmpegLocalMediaRunner:
             cwd=work_dir,
         )
 
-    def _run(self, arguments: Sequence[str], *, cwd: Path) -> None:
+    def _probe_duration_seconds(self, path: Path) -> float:
+        try:
+            duration = probe_media(
+                os.fspath(path),
+                ffmpeg_path=self.executable,
+                timeout=min(self.timeout_seconds, 30.0),
+            ).duration_seconds
+        except MediaProbeError:
+            duration = None
+        return duration if duration and duration > 0 else 1 / 30
+
+    def _probe_duration_seconds_or_none(self, path: Path) -> float | None:
+        """Like ``_probe_duration_seconds`` but with a distinguishable
+        failure. The 1/30 sentinel is harmless when padding silence; a
+        caller that derives fades from it would mute everything after the
+        33ms fade-out window."""
+
+        try:
+            duration = probe_media(
+                os.fspath(path),
+                ffmpeg_path=self.executable,
+                timeout=min(self.timeout_seconds, 30.0),
+            ).duration_seconds
+        except MediaProbeError:
+            return None
+        return duration if duration and duration > 0 else None
+
+    def _measure_loudness(self, path: Path) -> dict[str, str] | None:
+        """First loudnorm pass: measure integrated stats as strings.
+
+        Returns ``None`` when the file has no audio or the measurement
+        cannot be parsed; the caller then skips normalization.
+        """
+
+        try:
+            process = subprocess.run(
+                [
+                    self.executable,
+                    "-hide_banner",
+                    "-i",
+                    os.fspath(path),
+                    "-af",
+                    (
+                        f"loudnorm=I={_LOUDNORM_TARGET_I}"
+                        f":TP={_LOUDNORM_TARGET_TP}"
+                        f":LRA={_LOUDNORM_TARGET_LRA}:print_format=json"
+                    ),
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if process.returncode != 0:
+            return None
+        tail = process.stderr[process.stderr.rfind("{") :]
+        try:
+            measured = json.loads(tail)
+        except ValueError:
+            return None
+        keys = (
+            "input_i",
+            "input_tp",
+            "input_lra",
+            "input_thresh",
+            "target_offset",
+        )
+        if not all(isinstance(measured.get(key), str) for key in keys):
+            return None
+        return {key: measured[key] for key in keys}
+
+    def _normalize_delivery_loudness(
+        self,
+        spec: LocalMediaExecutionSpec,
+    ) -> str | None:
+        """Land the finished film on the delivery loudness target.
+
+        Two-pass linear loudnorm: pass 1 measures, pass 2 applies one
+        constant gain. Single-pass loudnorm rides a sliding window and
+        would pump the deliberately quiet music bed back up between
+        speech windows, undoing the layer levels the mixer just set.
+        Every composed film is normalized, with or without audio
+        Elements. Failure keeps the un-normalized film.
+        """
+
+        if not self._probe_has_audio(spec.output_path):
+            return None
+        measured = self._measure_loudness(spec.output_path)
+        if measured is None:
+            return "交付响度测量失败，保留未归一的成片音频"
+        preloud = spec.work_dir / "preloud.mp4"
+        os.replace(spec.output_path, preloud)
+        try:
+            stderr = self._run(
+                [
+                    "-y",
+                    "-i",
+                    os.fspath(preloud),
+                    "-af",
+                    (
+                        f"loudnorm=I={_LOUDNORM_TARGET_I}"
+                        f":TP={_LOUDNORM_TARGET_TP}"
+                        f":LRA={_LOUDNORM_TARGET_LRA}"
+                        f":measured_I={measured['input_i']}"
+                        f":measured_TP={measured['input_tp']}"
+                        f":measured_LRA={measured['input_lra']}"
+                        f":measured_thresh={measured['input_thresh']}"
+                        f":offset={measured['target_offset']}"
+                        ":linear=true:print_format=json,aresample=48000"
+                    ),
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    os.fspath(spec.output_path),
+                ],
+                cwd=spec.work_dir,
+            )
+        except Exception:  # pylint: disable=broad-except
+            os.replace(preloud, spec.output_path)
+            return "交付响度归一失败，保留未归一的成片音频"
+        # linear=true is a request, not a guarantee: ffmpeg silently
+        # falls back to dynamic mode when the constant gain would break
+        # the true-peak ceiling. Make that observable.
+        tail = (stderr or "")[max((stderr or "").rfind("{"), 0) :]
+        try:
+            applied = json.loads(tail)
+        except ValueError:
+            applied = {}
+        if applied.get("normalization_type", "").lower() != "linear":
+            logger.warning(
+                "delivery loudnorm fell back to dynamic mode for %s; "
+                "layer levels may pump",
+                spec.output_path.name,
+            )
+        return None
+
+    def _run(self, arguments: Sequence[str], *, cwd: Path) -> str:
+        """Run ffmpeg to completion and return its stderr text."""
+
         try:
             process = subprocess.Popen(
                 [self.executable, *arguments],
@@ -950,6 +2279,7 @@ class FfmpegLocalMediaRunner:
         if process.returncode != 0:
             detail = (stderr or stdout or "ffmpeg failed")[-4000:]
             raise ConflictError(f"ffmpeg 执行失败: {detail}")
+        return stderr or ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -983,10 +2313,33 @@ class _FrozenInput:
     start_seconds: float | None = None
     end_seconds: float | None = None
     duration_seconds: float | None = None
+    playback_rate: float = 1.0
     original_sound: str = "preserve"
     location: Mapping[str, Any] | None = None
-    overlay: Mapping[str, Any] | None = None
+    overlays: tuple[Mapping[str, Any], ...] = ()
     motions: tuple[Mapping[str, Any], ...] = ()
+    motion_clip: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenAudioTrack:
+    """One enabled Timeline audio Element resolved to its source version."""
+
+    element_id: str
+    version_id: str
+    indexed: IndexedFile | None
+    checksum: str
+    media_type: str
+    source_url: str | None
+    offset_seconds: float
+    max_duration_seconds: float
+    gain_db: float
+    pan: float
+    # Always taken from creation.role (required in the model); no default
+    # so this cannot drift from the mixer's legacy-dict narration fallback.
+    role: str
+    fade_in_seconds: float = 0.0
+    fade_out_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1005,6 +2358,9 @@ class _ResolvedExecution:
     artifact_name: str
     read_set: tuple[dict[str, Any], ...]
     source_selections: tuple[dict[str, Any], ...]
+    audio_tracks: tuple[_FrozenAudioTrack, ...] = ()
+    speech_windows: tuple[tuple[float, float], ...] = ()
+    color_grade: str = ""
 
 
 def _stable_id(prefix: str, project_id: str, key: str) -> str:
@@ -1129,7 +2485,18 @@ def _indexed_version(
     media_type = (
         indexed.media_type if indexed is not None else version.media_type
     )
-    if not media_type.casefold().startswith("video/"):
+    normalized_media_type = media_type.casefold()
+    if not normalized_media_type.startswith(
+        ("video/", "image/"),
+    ):
+        raise ValidationError(f"媒体输入不是视频或图片: {version_id}")
+    if (
+        normalized_media_type.startswith("image/")
+        and require_artifact is False
+    ):
+        # Source images stay outside the composition main track; only
+        # generated artifact stills may back a segment (pure
+        # motion-graphics cuts render generated backdrops).
         raise ValidationError(f"媒体输入不是视频: {version_id}")
     return indexed, version
 
@@ -1200,19 +2567,55 @@ def _motion_document_matches_text(html: str, text: str) -> bool:
     needle = re.sub(r"\s+", "", text)
     if not needle:
         return True
-    plain = re.sub(r"<[^>]+>", "", html)
+    # Blueprint documents commonly split copy into per-character spans and
+    # represent spaces as ``&nbsp;``. Compare the browser-visible text, not
+    # the raw entity spelling, or valid waterfall titles silently fall back
+    # to the legacy pet-OS renderer.
+    plain = unescape(re.sub(r"<[^>]+>", "", html))
     return needle in re.sub(r"\s+", "", plain)
 
 
-def _edit_overlay(
+def _motion_document_payload(
+    project: Project,
+    motion: Any,
+) -> dict[str, Any]:
+    """Render-facing facts of one MotionGraphic without loading files.
+
+    ``checksum`` always identifies the document content (inline hash or
+    the IndexedFile digest), so fingerprints never embed the raw html.
+    ``html_js`` entries additionally carry the engine salt: any vendored
+    runtime or prelude upgrade invalidates the render fingerprint.
+    """
+
+    if motion.html is not None:
+        checksum = hashlib.sha256(motion.html.encode("utf-8")).hexdigest()
+    else:
+        indexed = project.assets.files_by_id.get(motion.html_file_id or "")
+        if indexed is None:
+            raise StorageIntegrityError(
+                f"motion 文档引用的 IndexedFile 不存在: {motion.html_file_id}",
+            )
+        checksum = indexed.sha256
+    payload: dict[str, Any] = {
+        "format": motion.format,
+        "html": motion.html,
+        "html_file_id": motion.html_file_id,
+        "checksum": checksum,
+    }
+    if motion.format == "html_js":
+        payload["engine"] = full_engine_digest()
+    return payload
+
+
+def _edit_overlays(
+    project: Project,
     timeline: Timeline,
     element: TimelineElement,
-) -> Mapping[str, Any] | None:
-    """Project one independently persisted Overlay onto one edit input.
+) -> tuple[Mapping[str, Any], ...]:
+    """Project all matching text Overlays onto one edit input.
 
-    The domain permits any number of overlapping Elements.  The current local
-    runner can burn in one text overlay per source segment, so it fails clearly
-    when the Timeline asks it to render more than that.
+    Overlays are returned in z_index order so the caller can burn them
+    sequentially and have them stack correctly.
     """
 
     def _owned(candidate: TimelineElement) -> bool:
@@ -1232,43 +2635,55 @@ def _edit_overlay(
             for candidate in timeline.elements_by_id.values()
             if candidate.enabled
             and isinstance(candidate.creation, OverlayCreation)
-            and candidate.creation.overlay_kind
-            in {"pet_os", "interview_summary"}
+            and candidate.creation.text.strip()
             and candidate.span.overlaps(element.span)
             and _owned(candidate)
         ),
         key=lambda candidate: (candidate.z_index, candidate.element_id),
     )
-    if not overlays:
-        return None
-    if len(overlays) > 1:
-        raise ValidationError(
-            f"本地 runner 暂不支持在 Element {element.element_id} 上叠加多个 Overlay Element",
+    result: list[Mapping[str, Any]] = []
+    for overlay in overlays:
+        intersection_start = max(
+            element.span.start_tick,
+            overlay.span.start_tick,
         )
-    overlay = overlays[0]
-    intersection_start = max(element.span.start_tick, overlay.span.start_tick)
-    intersection_end = min(element.span.end_tick, overlay.span.end_tick)
-    motion = overlay.creation.motion
-    return {
-        "kind": overlay.creation.overlay_kind,
-        "text": overlay.creation.text,
-        "vibe": overlay.creation.vibe,
-        "location": (
-            overlay.location.model_dump(mode="json")
-            if overlay.location is not None
-            else None
-        ),
-        "motion": (
-            {"html": motion.html, "fps": motion.fps, "loop": motion.loop}
-            if motion is not None
-            else None
-        ),
-        "appear_at": (intersection_start - element.span.start_tick)
-        / timeline.ticks_per_second,
-        "duration": (intersection_end - intersection_start)
-        / timeline.ticks_per_second,
-        "element_id": overlay.element_id,
-    }
+        intersection_end = min(element.span.end_tick, overlay.span.end_tick)
+        motion = overlay.creation.motion
+        result.append(
+            {
+                # Fixed fallback styling tag: overlay roles derive from
+                # data (non-empty text = caption).  vibe="summary" is the
+                # migrated interview_summary presentation and keeps the
+                # interview card fallback instead of the pet-OS bubble.
+                "kind": (
+                    "interview_summary"
+                    if overlay.creation.vibe == "summary"
+                    else "pet_os"
+                ),
+                "text": overlay.creation.text,
+                "vibe": overlay.creation.vibe,
+                "location": (
+                    overlay.location.model_dump(mode="json")
+                    if overlay.location is not None
+                    else None
+                ),
+                "motion": (
+                    {
+                        **_motion_document_payload(project, motion),
+                        "fps": motion.fps,
+                        "loop": motion.loop,
+                    }
+                    if motion is not None
+                    else None
+                ),
+                "appear_at": (intersection_start - element.span.start_tick)
+                / timeline.ticks_per_second,
+                "duration": (intersection_end - intersection_start)
+                / timeline.ticks_per_second,
+                "element_id": overlay.element_id,
+            },
+        )
+    return tuple(result)
 
 
 def _plan_timeline_transitions(
@@ -1397,6 +2812,7 @@ def _validate_contiguous_edit_elements(
 
 
 def _edit_motion_overlays(
+    project: Project,
     timeline: Timeline,
     element: TimelineElement,
 ) -> tuple[Mapping[str, Any], ...]:
@@ -1412,7 +2828,7 @@ def _edit_motion_overlays(
             for candidate in timeline.elements_by_id.values()
             if candidate.enabled
             and isinstance(candidate.creation, OverlayCreation)
-            and candidate.creation.overlay_kind == "motion"
+            and not candidate.creation.text.strip()
             and candidate.creation.motion is not None
             and candidate.span.overlaps(element.span)
         ),
@@ -1429,7 +2845,7 @@ def _edit_motion_overlays(
         motions.append(
             {
                 "element_id": overlay.element_id,
-                "html": motion.html,
+                **_motion_document_payload(project, motion),
                 "fps": motion.fps,
                 "loop": motion.loop,
                 "location": (
@@ -1446,6 +2862,114 @@ def _edit_motion_overlays(
     return tuple(motions)
 
 
+def _append_motion_clip_input(
+    *,
+    project: Project,
+    timeline: Timeline,
+    element: TimelineElement,
+    order: int,
+    inputs: list[_FrozenInput],
+    read_set: list[dict[str, Any]],
+    selections: list[dict[str, Any]],
+    durations: list[float | None],
+) -> None:
+    """Resolve one full-canvas motion clip element into a frozen input.
+
+    The document is the segment's whole picture, so it must already be
+    designed and externalized (content-addressed) before composition;
+    an undesigned clip dead-ends the command instead of shipping a
+    silent black segment.
+    """
+
+    creation = element.creation
+    assert isinstance(creation, MotionClipCreation)
+    motion = creation.motion
+    if motion is None:
+        raise ConflictError(
+            f"动效片段 {element.element_id} 尚未完成动效设计，请先运行动效设计管线",
+        )
+    if motion.html_file_id is None:
+        raise ConflictError(
+            f"动效片段 {element.element_id} 的文档未外部化，请通过动效设计管线重新生成",
+        )
+    indexed = project.assets.files_by_id.get(motion.html_file_id)
+    if indexed is None:
+        raise StorageIntegrityError(
+            f"动效片段引用的 IndexedFile 不存在: {motion.html_file_id}",
+        )
+    span_seconds = element.span.duration_tick / timeline.ticks_per_second
+    payload = {
+        "element_id": element.element_id,
+        **_motion_document_payload(project, motion),
+        "fps": motion.fps,
+        "loop": motion.loop,
+        "location": None,
+        "appear_at": 0.0,
+        "duration": span_seconds,
+    }
+    inputs.append(
+        _FrozenInput(
+            version_id=f"motion-clip-{element.element_id}",
+            indexed=indexed,
+            checksum=f"sha256:{indexed.sha256}",
+            source_ref=f"element:{element.element_id}",
+            media_type="text/html",
+            start_seconds=0.0,
+            end_seconds=span_seconds,
+            location=(
+                element.location.model_dump(mode="json")
+                if element.location is not None
+                else None
+            ),
+            overlays=_edit_overlays(project, timeline, element),
+            motions=_edit_motion_overlays(project, timeline, element),
+            motion_clip=payload,
+        ),
+    )
+    read_set.append(
+        _read_set_item(
+            "motion-document",
+            motion.html_file_id,
+            indexed,
+            f"sha256:{indexed.sha256}",
+        ),
+    )
+    selections.append(
+        {
+            "sourceRef": f"element:{element.element_id}",
+            "versionId": f"motion-clip-{element.element_id}",
+            "order": order,
+            "startTick": element.span.start_tick,
+            "durationTick": element.span.duration_tick,
+            "sourceInTick": None,
+            "sourceOutTick": None,
+        },
+    )
+    durations.append(span_seconds)
+
+
+def _resolved_fade_seconds(
+    creation: AudioCreation,
+    span_seconds: float,
+) -> tuple[float, float]:
+    """Fades are the agent's creative call; an unset value adapts to the
+    span so a short bgm segment is not swallowed by its ramps."""
+
+    default_fade = (
+        min(_BGM_DEFAULT_FADE_SECONDS, span_seconds / 4)
+        if creation.role == "bgm"
+        else 0.0
+    )
+    return (
+        creation.fade_in_seconds
+        if creation.fade_in_seconds is not None
+        else default_fade,
+        creation.fade_out_seconds
+        if creation.fade_out_seconds is not None
+        else default_fade,
+    )
+
+
 def _timeline_execution(
     *,
     project: Project,
@@ -1453,10 +2977,17 @@ def _timeline_execution(
     target_ref: str,
     command: CreatorCommandType,
 ) -> _ResolvedExecution:
-    creation_types = (
+    creation_types: tuple[type, ...] = (
         (EditCreation,)
         if command is CreatorCommandType.EXECUTE_EDIT
-        else (R2VCreation, EditCreation)
+        else (
+            R2VCreation,
+            T2VCreation,
+            I2VCreation,
+            S2VCreation,
+            EditCreation,
+            MotionClipCreation,
+        )
     )
     visual_elements = sorted(
         (
@@ -1481,6 +3012,18 @@ def _timeline_execution(
     selections: list[dict[str, Any]] = []
     durations: list[float | None] = []
     for order, element in enumerate(visual_elements, 1):
+        if isinstance(element.creation, MotionClipCreation):
+            _append_motion_clip_input(
+                project=project,
+                timeline=timeline,
+                element=element,
+                order=order,
+                inputs=inputs,
+                read_set=read_set,
+                selections=selections,
+                durations=durations,
+            )
+            continue
         indexed, version, version_kind = _resolved_element_input(
             project,
             element,
@@ -1497,6 +3040,16 @@ def _timeline_execution(
             )
             end_seconds = (
                 render_source.source_out_tick / timeline.ticks_per_second
+            )
+        elif isinstance(
+            element.creation,
+            (R2VCreation, T2VCreation, I2VCreation, S2VCreation),
+        ):
+            # For generated-video elements, use the span duration to allow
+            # length adjustment
+            start_seconds = 0.0
+            end_seconds = (
+                element.span.duration_tick / timeline.ticks_per_second
             )
         inputs.append(
             _FrozenInput(
@@ -1517,6 +3070,11 @@ def _timeline_execution(
                 duration_seconds=version.duration_seconds,
                 start_seconds=start_seconds,
                 end_seconds=end_seconds,
+                playback_rate=(
+                    render_source.playback_rate
+                    if isinstance(element.creation, EditCreation)
+                    else 1.0
+                ),
                 original_sound=(
                     element.creation.original_sound
                     if isinstance(element.creation, EditCreation)
@@ -1527,8 +3085,8 @@ def _timeline_execution(
                     if element.location is not None
                     else None
                 ),
-                overlay=_edit_overlay(timeline, element),
-                motions=_edit_motion_overlays(timeline, element),
+                overlays=_edit_overlays(project, timeline, element),
+                motions=_edit_motion_overlays(project, timeline, element),
             ),
         )
         read_set.append(
@@ -1577,6 +3135,62 @@ def _timeline_execution(
         if all(item is not None for item in durations)
         else None
     )
+    audio_tracks: list[_FrozenAudioTrack] = []
+    for element in sorted(
+        (
+            item
+            for item in timeline.elements_by_id.values()
+            if item.enabled and isinstance(item.creation, AudioCreation)
+        ),
+        key=lambda item: (item.span.start_tick, item.element_id),
+    ):
+        creation = element.creation
+        assert isinstance(creation, AudioCreation)
+        version = project.assets.source_versions_by_id[
+            creation.source_asset_version_id
+        ]
+        indexed = (
+            project.assets.files_by_id.get(version.file_id)
+            if version.file_id is not None
+            else None
+        )
+        span_seconds = element.span.duration_tick / timeline.ticks_per_second
+        role = creation.role
+        fade_in, fade_out = _resolved_fade_seconds(creation, span_seconds)
+        audio_tracks.append(
+            _FrozenAudioTrack(
+                element_id=element.element_id,
+                version_id=version.version_id,
+                indexed=indexed,
+                checksum=version.checksum,
+                media_type=(
+                    indexed.media_type
+                    if indexed is not None
+                    else version.media_type
+                ),
+                source_url=(
+                    public_source_url(version) if indexed is None else None
+                ),
+                offset_seconds=(
+                    element.span.start_tick / timeline.ticks_per_second
+                ),
+                max_duration_seconds=span_seconds,
+                gain_db=creation.gain_db,
+                pan=creation.pan,
+                role=role,
+                fade_in_seconds=fade_in,
+                fade_out_seconds=fade_out,
+            ),
+        )
+        read_set.append(
+            _read_set_item(
+                "asset-version",
+                version.version_id,
+                indexed,
+                version.checksum,
+            ),
+        )
+    speech_windows = _timeline_speech_windows(timeline) if audio_tracks else ()
     return _ResolvedExecution(
         command=command,
         target_ref=target_ref,
@@ -1603,7 +3217,61 @@ def _timeline_execution(
         ),
         read_set=tuple(read_set),
         source_selections=tuple(selections),
+        audio_tracks=tuple(audio_tracks),
+        speech_windows=speech_windows,
+        color_grade=timeline.color_grade,
     )
+
+
+def _timeline_speech_windows(
+    timeline: Timeline,
+) -> tuple[tuple[float, float], ...]:
+    """[start, end) seconds where clips natively speak.
+
+    Shot-granular for R2V: only the dialogue-bearing shots count, so BGM
+    keeps its bed level through the silent shots of the same element.
+    Shots are placed by scaling their declared durations onto the element
+    span (the provider renders the shot list into exactly the span, so
+    relative durations are the trustworthy signal); the whole element
+    span is the safe fallback when any duration is unusable. s2v digital
+    humans speak for their entire span.
+    """
+
+    windows: list[tuple[float, float]] = []
+    for element in timeline.elements_by_id.values():
+        if not element.enabled:
+            continue
+        creation = element.creation
+        element_start = element.span.start_tick / timeline.ticks_per_second
+        element_end = element.span.end_tick / timeline.ticks_per_second
+        if isinstance(creation, S2VCreation):
+            windows.append((element_start, element_end))
+            continue
+        if not isinstance(creation, R2VCreation):
+            continue
+        shots = [
+            creation.shots.items[shot_id] for shot_id in creation.shots.order
+        ]
+        if not any(shot.dialogue.strip() for shot in shots):
+            continue
+        total_seconds = sum(shot.duration_seconds for shot in shots)
+        if (
+            any(shot.duration_seconds <= 0 for shot in shots)
+            or total_seconds <= 0
+        ):
+            windows.append((element_start, element_end))
+            continue
+        scale = (element_end - element_start) / total_seconds
+        cursor = element_start
+        for shot in shots:
+            shot_start = cursor
+            cursor = min(
+                cursor + shot.duration_seconds * scale,
+                element_end,
+            )
+            if shot.dialogue.strip() and cursor > shot_start:
+                windows.append((shot_start, cursor))
+    return tuple(sorted(windows))
 
 
 def _resolve_execution(
@@ -1624,6 +3292,14 @@ def _resolve_execution(
         )
     if command is CreatorCommandType.COMPOSE_FINAL_VIDEO:
         timeline = _target_timeline(project, target_ref)
+        # Scene-loop gate (upstream scene_gate): a declared ledger must be
+        # fully locked with fresh fingerprints before the expensive master
+        # render; the check itself is pure computation.
+        from services.render_review.scene_review import (
+            validate_scene_ledger_locked,
+        )
+
+        validate_scene_ledger_locked(timeline)
         return _timeline_execution(
             project=project,
             timeline=timeline,
@@ -1631,6 +3307,29 @@ def _resolve_execution(
             command=command,
         )
     raise ValidationError(f"不支持的本地媒体命令: {command.value}")
+
+
+def _fingerprint_motion(motion: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one motion mapping for fingerprinting.
+
+    The raw html body never enters the fingerprint; ``checksum`` (plus the
+    engine salt for html_js) fully identifies the rendered output, and it
+    is available without loading externalized documents from disk.
+    """
+
+    return {key: value for key, value in motion.items() if key != "html"}
+
+
+def _fingerprint_overlay(
+    overlay: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if overlay is None:
+        return None
+    data = dict(overlay)
+    motion = data.get("motion")
+    if isinstance(motion, Mapping):
+        data["motion"] = _fingerprint_motion(motion)
+    return data
 
 
 def _resolved_fingerprint(resolved: _ResolvedExecution) -> str:
@@ -1648,7 +3347,27 @@ def _resolved_fingerprint(resolved: _ResolvedExecution) -> str:
             # Renderer behaviour version: bump it when a semantic fix in the
             # rendering logic (e.g. the stale motion-document fallback) must
             # invalidate old renders and force recomposition.
-            "rendererVersion": 2,
+            # v3: audio is filter-concatenated from decoded segments — the
+            # stream-copied joints produced oversized AAC packets browsers
+            # refuse to decode, freezing every seek past the first joint.
+            # v4: html_js overlays no longer receive the legacy
+            # viewport-safety CSS injection whose wildcard font overrides
+            # stomped the blueprint clamps in the composite only.
+            # v5: subtitle fallback box height increased (0.18→0.25),
+            # padding consistency fix in PIL/interview-summary renderers,
+            # keyword overlay max_edge_contact aligned with design-time.
+            # v6: caption safety fallback now uses element's actual location
+            # dimensions for font sizing; edge contact threshold aligned
+            # with design-time text card budget (1.0).
+            # v7: static_capsule blueprint uses dynamic _caption_font_css()
+            # instead of fixed font-size:24vh; cinematic colorbalance
+            # preset fixed (invalid sm → valid rs/gs/bs channels).
+            # v8: caption blueprint font size scaled inversely by overlay
+            # box height so apparent canvas-relative size stays consistent
+            # across overlays with very different box dimensions.
+            # v9: Edit playback_rate retimes both picture and source sound;
+            # segment and transition durations now stay on Timeline time.
+            "rendererVersion": 9,
             "targetRef": resolved.target_ref,
             "inputs": [
                 {
@@ -1663,16 +3382,65 @@ def _resolved_fingerprint(resolved: _ResolvedExecution) -> str:
                     "sourceRef": item.source_ref,
                     "start": item.start_seconds,
                     "end": item.end_seconds,
+                    "playbackRate": item.playback_rate,
                     "originalSound": item.original_sound,
                     "location": item.location,
-                    "overlay": item.overlay,
-                    "motions": [dict(motion) for motion in item.motions],
+                    "overlays": [
+                        _fingerprint_overlay(o) for o in item.overlays
+                    ],
+                    "motions": [
+                        _fingerprint_motion(motion) for motion in item.motions
+                    ],
+                    # Key omitted for media-backed inputs so every
+                    # fingerprint computed before motion clips existed
+                    # stays byte-identical (no mass recomposition).
+                    **(
+                        {
+                            "motionClip": _fingerprint_motion(
+                                item.motion_clip,
+                            ),
+                        }
+                        if item.motion_clip is not None
+                        else {}
+                    ),
                 }
                 for item in resolved.inputs
             ],
             "transitions": list(resolved.transitions),
             "audioPlan": resolved.audio_plan,
             "canvasSize": list(resolved.canvas_size),
+            # Only present when a grade is configured so every historical
+            # fingerprint (and its reusable render) stays byte-identical.
+            **(
+                {"colorGrade": resolved.color_grade}
+                if resolved.color_grade
+                else {}
+            ),
+            # Only present when the Timeline has audio Elements so historical
+            # audio-free fingerprints (and their reusable renders) survive.
+            **(
+                {
+                    "audioTracks": [
+                        {
+                            "versionId": track.version_id,
+                            "checksum": track.checksum,
+                            "offset": track.offset_seconds,
+                            "maxDuration": track.max_duration_seconds,
+                            "gainDb": track.gain_db,
+                            "pan": track.pan,
+                            "role": track.role,
+                            "fadeIn": track.fade_in_seconds,
+                            "fadeOut": track.fade_out_seconds,
+                        }
+                        for track in resolved.audio_tracks
+                    ],
+                    "speechWindows": [
+                        list(window) for window in resolved.speech_windows
+                    ],
+                }
+                if resolved.audio_tracks
+                else {}
+            ),
         },
     )
 
@@ -1745,6 +3513,47 @@ def _terminal_task_message(task: TaskRecord) -> str:
         if detail and detail != message:
             message = f"{message}: {detail}"
     return message
+
+
+def _materialized_motion(
+    project: Project,
+    file_store: AssetFileStore,
+    motion: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Load one externalized motion document body for rendering.
+
+    Content is verified against the IndexedFile digest on open, so a
+    corrupted or swapped file fails the task instead of rendering silently
+    wrong frames.
+    """
+
+    if motion.get("html"):
+        return motion
+    file_id = str(motion.get("html_file_id") or "")
+    indexed = project.assets.files_by_id.get(file_id)
+    if indexed is None:
+        raise StorageIntegrityError(
+            f"motion 文档引用的 IndexedFile 不存在: {file_id}",
+        )
+    with file_store.open_verified(indexed) as stream:
+        html = stream.read().decode("utf-8")
+    return {**motion, "html": html}
+
+
+def _materialized_overlay(
+    project: Project,
+    file_store: AssetFileStore,
+    overlay: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if overlay is None:
+        return None
+    motion = overlay.get("motion")
+    if not isinstance(motion, Mapping) or motion.get("html"):
+        return overlay
+    return {
+        **overlay,
+        "motion": _materialized_motion(project, file_store, motion),
+    }
 
 
 class FileLocalMediaExecutionService:
@@ -1826,6 +3635,25 @@ class FileLocalMediaExecutionService:
             for value in expected_object_versions
         ):
             raise ConflictError("本地媒体命令目标已被其他写者修改")
+        if command_value is CreatorCommandType.COMPOSE_FINAL_VIDEO:
+            from services.render_review.scene_review import (
+                auto_review_stale_scenes,
+                collect_scene_review_targets,
+            )
+
+            timeline = _target_timeline(base.project, target_ref)
+            stale, drafts = collect_scene_review_targets(timeline)
+            if stale or drafts:
+                await auto_review_stale_scenes(
+                    self.services,
+                    project_id=project_id,
+                    timeline_ref=target_ref,
+                    timeline=timeline,
+                )
+                base = await asyncio.to_thread(
+                    self.services.projects.read,
+                    project_id,
+                )
         resolved = await asyncio.to_thread(
             _resolve_execution,
             snapshot=base,
@@ -1844,6 +3672,12 @@ class FileLocalMediaExecutionService:
             reference_version_ids=tuple(
                 item.version_id for item in resolved.inputs
             ),
+        )
+        logger.info(
+            "local_media execute: project=%s task=%s command=%s",
+            _log_safe(project_id),
+            ids["task_id"],
+            command_value.value,
         )
         request_fingerprint = _resolved_fingerprint(resolved)
         reuse = await asyncio.to_thread(
@@ -1960,6 +3794,7 @@ class FileLocalMediaExecutionService:
                 ids,
                 "LOCAL_MEDIA_EXECUTION_FAILED",
                 message=str(exc),
+                error=exc,
             )
             raise
         except AssetFileError as exc:
@@ -1968,6 +3803,7 @@ class FileLocalMediaExecutionService:
                 ids,
                 "LOCAL_MEDIA_EXECUTION_FAILED",
                 message=str(exc),
+                error=exc,
             )
             raise StorageIntegrityError(str(exc)) from exc
         except Exception as exc:
@@ -1976,6 +3812,7 @@ class FileLocalMediaExecutionService:
                 ids,
                 "LOCAL_MEDIA_EXECUTION_FAILED",
                 message=str(exc),
+                error=exc,
             )
             raise StorageIntegrityError(f"本地媒体执行失败: {exc}") from exc
 
@@ -2130,7 +3967,10 @@ class FileLocalMediaExecutionService:
         }
 
         def claim_sync():
-            with self.services.projects.lifecycle_lock(task.project_id):
+            with self.services.projects.lifecycle_lock(
+                task.project_id,
+                shared=True,
+            ):
                 self.services.projects.read(task.project_id)
                 project_root = self.services.projects.project_root(
                     task.project_id,
@@ -2202,6 +4042,7 @@ class FileLocalMediaExecutionService:
                             "sourceUrl": item.source_url,
                             "start": item.start_seconds,
                             "end": item.end_seconds,
+                            "playbackRate": item.playback_rate,
                         }
                         for item in resolved.inputs
                     ],
@@ -2318,15 +4159,81 @@ class FileLocalMediaExecutionService:
                     start_seconds=frozen.start_seconds,
                     end_seconds=frozen.end_seconds,
                     duration_seconds=frozen.duration_seconds,
+                    playback_rate=frozen.playback_rate,
                     original_sound=frozen.original_sound,
                     location=frozen.location,
-                    overlay=frozen.overlay,
-                    motions=frozen.motions,
+                    overlays=tuple(
+                        _materialized_overlay(
+                            base.project,
+                            file_store,
+                            overlay,
+                        )
+                        for overlay in frozen.overlays
+                    ),
+                    motions=tuple(
+                        _materialized_motion(
+                            base.project,
+                            file_store,
+                            motion,
+                        )
+                        for motion in frozen.motions
+                    ),
+                    motion_clip=(
+                        _materialized_motion(
+                            base.project,
+                            file_store,
+                            frozen.motion_clip,
+                        )
+                        if frozen.motion_clip is not None
+                        else None
+                    ),
                 ),
             )
         output_path = work_dir / "output.mp4"
         if output_path.exists():
             raise StorageIntegrityError("Task output scratch 已存在")
+
+        audio_dir: Path | None = None
+        local_audio_tracks: list[dict[str, Any]] = []
+        for track_index, track in enumerate(resolved.audio_tracks):
+            if audio_dir is None:
+                audio_dir = _ensure_real_directory_chain(work_dir, "audio")
+            suffix = mimetypes.guess_extension(track.media_type) or ".wav"
+            if not suffix.startswith(".") or len(suffix) > 12:
+                suffix = ".wav"
+            destination = audio_dir / (
+                f"{track_index:06d}-{track.version_id}{suffix}"
+            )
+            if destination.exists():
+                raise StorageIntegrityError("Task audio scratch 已存在")
+            if track.indexed is not None:
+                with (
+                    file_store.open_verified(track.indexed) as source,
+                    destination.open("xb") as target,
+                ):
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
+            elif track.source_url is not None:
+                download_remote_file(track.source_url, str(destination))
+            else:
+                raise StorageIntegrityError(
+                    f"音频输入缺少本地文件与公网 URL: {track.version_id}",
+                )
+            local_audio_tracks.append(
+                {
+                    "element_id": track.element_id,
+                    "version_id": track.version_id,
+                    "path": destination,
+                    "offset_seconds": track.offset_seconds,
+                    "max_duration_seconds": track.max_duration_seconds,
+                    "gain_db": track.gain_db,
+                    "pan": track.pan,
+                    "role": track.role,
+                    "fade_in_seconds": track.fade_in_seconds,
+                    "fade_out_seconds": track.fade_out_seconds,
+                },
+            )
 
         def on_element_done(done: int, total: int) -> None:
             if total <= 0:
@@ -2363,6 +4270,9 @@ class FileLocalMediaExecutionService:
             expected_duration_seconds=resolved.expected_duration_seconds,
             canvas_size=resolved.canvas_size,
             on_element_done=on_element_done,
+            audio_tracks=tuple(local_audio_tracks),
+            speech_windows=resolved.speech_windows,
+            color_grade=resolved.color_grade,
         )
         AtomicJsonRecordStore(work_dir / "spec.json").write(
             {
@@ -2379,15 +4289,36 @@ class FileLocalMediaExecutionService:
                         "path": item.path.relative_to(project_root).as_posix(),
                         "start": item.start_seconds,
                         "end": item.end_seconds,
+                        "playbackRate": item.playback_rate,
                         "originalSound": item.original_sound,
                         "location": item.location,
-                        "overlay": item.overlay,
+                        "overlays": [dict(o) for o in item.overlays],
                         "motions": [dict(motion) for motion in item.motions],
                     }
                     for item in local_inputs
                 ],
                 "outputPath": output_path.relative_to(project_root).as_posix(),
                 "canvasSize": list(resolved.canvas_size),
+                "audioTracks": [
+                    {
+                        "elementId": item["element_id"],
+                        "versionId": item["version_id"],
+                        "path": item["path"]
+                        .relative_to(project_root)
+                        .as_posix(),
+                        "offset": item["offset_seconds"],
+                        "maxDuration": item["max_duration_seconds"],
+                        "gainDb": item["gain_db"],
+                        "pan": item["pan"],
+                        "role": item["role"],
+                        "fadeIn": item["fade_in_seconds"],
+                        "fadeOut": item["fade_out_seconds"],
+                    }
+                    for item in local_audio_tracks
+                ],
+                "speechWindows": [
+                    list(window) for window in resolved.speech_windows
+                ],
             },
         )
         return spec
@@ -2541,14 +4472,20 @@ class FileLocalMediaExecutionService:
                     self._apply_result(candidate, result)
                     # Final composition is deterministic assembly (every input
                     # was reviewed individually), so it skips the review flow;
-                    # all other local media artifacts stay reviewed.
+                    # other local media artifacts follow the operator's media
+                    # review mode. An AUTO_FIX round cannot carry a boundary.
                     is_final_compose = (
                         result.get("commandType")
                         == CreatorCommandType.COMPOSE_FINAL_VIDEO.value
                     )
+                    review_policy = (
+                        ReviewPolicy.AUTO_FIX
+                        if is_final_compose
+                        else media_review_policy()
+                    )
                     review_boundary = (
                         None
-                        if is_final_compose
+                        if review_policy is not ReviewPolicy.REQUIRE_REVIEW
                         else self.services.commits.runtime_review_boundary(
                             task.project_id,
                             run_id=str(task.run_id),
@@ -2559,11 +4496,7 @@ class FileLocalMediaExecutionService:
                         base=current,
                         candidate=candidate,
                         origin=ChangeOrigin.RUNTIME_TASK,
-                        review_policy=(
-                            ReviewPolicy.AUTO_FIX
-                            if is_final_compose
-                            else ReviewPolicy.REQUIRE_REVIEW
-                        ),
+                        review_policy=review_policy,
                         review_boundary=review_boundary,
                         caused_by_request_id=latest.caused_by_request_id,
                         round_id=ids["round_id"],
@@ -2780,6 +4713,7 @@ class FileLocalMediaExecutionService:
         code: str,
         *,
         message: str | None = None,
+        error: BaseException | None = None,
     ) -> None:
         try:
             task = await asyncio.to_thread(
@@ -2789,6 +4723,23 @@ class FileLocalMediaExecutionService:
             )
         except RecordNotFoundError:
             return
+        report = report_error(
+            component="local-media-execution",
+            code=code,
+            message=message or code,
+            error=error,
+            details={
+                "projectId": project_id,
+                "taskId": task.task_id,
+                "runId": ids.get("run_id"),
+            },
+            projectId=project_id,
+            taskId=task.task_id,
+            runId=ids.get("run_id"),
+        )
+        failure = {
+            key: value for key, value in report.items() if value is not None
+        }
         if task.status is TaskStatus.RUNNING:
             try:
                 await asyncio.to_thread(
@@ -2798,7 +4749,7 @@ class FileLocalMediaExecutionService:
                     event_id=ids["attempt_failed_event_id"],
                     attempt_id=ids["attempt_id"],
                     status=TaskAttemptStatus.FAILED,
-                    error={"code": code, "message": message or code},
+                    error=failure,
                 )
             except ExecutionStateConflict:
                 pass
@@ -2883,9 +4834,24 @@ class FileLocalMediaExecutionService:
                     pass
                 recovered.append(task.task_id)
                 continue
+            report = report_error(
+                component="local-media-execution",
+                code="LOCAL_MEDIA_PROCESS_RESTARTED",
+                message="进程重启前本地媒体执行未形成可收敛结果",
+                retryable=True,
+                details={
+                    "projectId": project_id,
+                    "taskId": task.task_id,
+                    "runId": str(task.run_id or ""),
+                },
+                projectId=project_id,
+                taskId=task.task_id,
+                runId=str(task.run_id or ""),
+            )
             error = {
-                "code": "LOCAL_MEDIA_PROCESS_RESTARTED",
-                "message": "进程重启前本地媒体执行未形成可收敛结果",
+                key: value
+                for key, value in report.items()
+                if value is not None
             }
             if task.status is TaskStatus.RUNNING:
                 try:
@@ -2922,8 +4888,8 @@ class FileLocalMediaExecutionService:
 
         self._closed = True
 
-    @staticmethod
     def _result_from_task(
+        self,
         task: TaskRecord,
         *,
         replayed: bool,
@@ -2940,6 +4906,16 @@ class FileLocalMediaExecutionService:
             raise StorageIntegrityError(
                 "SUCCEEDED 本地媒体 Task 缺少可重放结果",
             ) from exc
+        # Self-review hook: every successful convergence (fresh render,
+        # idempotent replay, fingerprint reuse and crash recovery) flows
+        # through this single point. Scheduling is advisory and idempotent:
+        # the switch, the command filter and already-reviewed dedup all live
+        # on the review side.
+        schedule_render_review(
+            self.services,
+            project_id=task.project_id,
+            published_result=result,
+        )
         return FileLocalMediaExecutionResult(
             task_id=task.task_id,
             run_id=str(task.run_id or ""),
@@ -3004,14 +4980,27 @@ def validate_local_media_execution(
     failures would be silently swallowed and the frontend would wait for a
     Task that never exists. The route layer calls this precheck first so the
     same ValidationError is raised to the caller explicitly.
+
+    Review admission is checked here for the same reason: execute() rejects
+    unreviewed inputs with ReviewPendingError before it persists the Task, so
+    without this precheck the route would return 202 with a taskId that never
+    materializes and the frontend would silently mark the compose as failed.
     """
 
     snapshot = services.projects.read(project_id)
-    _resolve_execution(
+    resolved = _resolve_execution(
         snapshot=snapshot,
         command=CreatorCommandType(command),
         target_ref=target_ref,
         arguments=dict(arguments or {}),
+    )
+    assert_media_review_admission(
+        reviews=services.reviews.all_pending(project_id),
+        command_type=resolved.command.value,
+        target_ref=resolved.target_ref,
+        reference_version_ids=tuple(
+            item.version_id for item in resolved.inputs
+        ),
     )
 
 

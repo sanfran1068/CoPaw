@@ -6,9 +6,10 @@
 
 The store is deliberately independent from the legacy SQL Runtime.  Mutable
 entity heads use atomic Pydantic JSON with checksum CAS; ordered attempts,
-messages and continuations use durable append-only JSONL.  Every mutating
-operation holds the same short Project Runtime lock used by the other
-filesystem aggregates.  Provider/model calls must happen outside that lock.
+messages and continuations use durable append-only JSONL. Every mutating
+operation holds the short Execution-domain Runtime lock. Session and Agent Run
+state use separate domain locks, while Project deletion remains ordered by the
+shared lifecycle lock. Provider/model calls must happen outside these locks.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from collections.abc import Collection, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -50,6 +52,13 @@ from .jsonl_store import DurableJsonlStore
 from .locking import CrossProcessFileLock
 from .models import ReviewPolicy, utc_now
 from .path_safety import require_safe_runtime_segment
+
+logger = logging.getLogger("qwenpaw.creator.runtime_files.execution_store")
+
+
+def _log_safe(value: object) -> str:
+    """Neutralise CR/LF so identifier values cannot forge log lines."""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
 
 
 class ExecutionStoreError(RuntimeFileError):
@@ -314,9 +323,9 @@ class ProjectExecutionStore:
         project_id: str,
         run_id: str,
         *,
-        expected_status: SpecialistRunStatus
-        | str
-        | Collection[SpecialistRunStatus | str],
+        expected_status: (
+            SpecialistRunStatus | str | Collection[SpecialistRunStatus | str]
+        ),
         status: SpecialistRunStatus | str,
         updates: Mapping[str, Any] | None = None,
         expected_checksum: str | None = None,
@@ -651,10 +660,23 @@ class ProjectExecutionStore:
             store = self._task_store(project_id, task_id)
             created = store.try_create(candidate)
             if created is not None:
+                logger.info(
+                    "task created: project=%s task=%s kind=%s run=%s status=%s",
+                    project_id,
+                    task_id,
+                    candidate.kind.value,
+                    candidate.run_id,
+                    candidate.status.value,
+                )
                 return created.value
             existing = store.read()
             self._assert_task_identity(existing, project_id, task_id)
             if self._equivalent(existing, candidate):
+                logger.debug(
+                    "task already exists (idempotent): project=%s task=%s",
+                    project_id,
+                    task_id,
+                )
                 return existing
             raise ExecutionPayloadConflict(
                 f"Task already exists with different payload: {task_id}",
@@ -981,7 +1003,13 @@ class ProjectExecutionStore:
                 project_id,
                 authorization_id,
             )
-            if self._equivalent(existing, candidate):
+            # authorization_id is derived deterministically from the
+            # request, so identical retries replay the durable record:
+            # compare the request signature, which ignores the per-call
+            # random token and the decision lifecycle fields.
+            if self._authorization_request_signature(
+                existing,
+            ) == self._authorization_request_signature(candidate):
                 return existing
             raise ExecutionPayloadConflict(
                 "authorization_id was reused with a different request",
@@ -1440,11 +1468,21 @@ class ProjectExecutionStore:
         )
         candidate = TaskRecord.model_validate(dumped)
         checksum = expected_checksum or snapshot.checksum
-        return (
+        result = (
             self._task_store(project_id, task_id)
             .compare_and_swap(expected_checksum=checksum, value=candidate)
             .value
         )
+        logger.info(
+            "task transition: project=%s task=%s kind=%s run=%s %s -> %s",
+            _log_safe(project_id),
+            _log_safe(task_id),
+            candidate.kind.value,
+            _log_safe(candidate.run_id),
+            current.status.value,
+            target.value,
+        )
+        return result
 
     # -- validation and paths -------------------------------------------
 
@@ -1763,7 +1801,7 @@ class ProjectExecutionStore:
             with CrossProcessFileLock(
                 self._runtime_root(project_id)
                 / "locks"
-                / "project-runtime.lock",
+                / "execution-runtime.lock",
                 timeout_seconds=self.lock_timeout_seconds,
             ):
                 yield
@@ -1771,12 +1809,13 @@ class ProjectExecutionStore:
         with CrossProcessFileLock(
             self.data_root / ".locks" / f"project-{project_id}.lock",
             timeout_seconds=self.lock_timeout_seconds,
+            shared=True,
         ):
             self._require_project(project_id)
             with CrossProcessFileLock(
                 self._runtime_root(project_id)
                 / "locks"
-                / "project-runtime.lock",
+                / "execution-runtime.lock",
                 timeout_seconds=self.lock_timeout_seconds,
             ):
                 yield
@@ -1799,7 +1838,7 @@ class ProjectExecutionStore:
             with CrossProcessFileLock(
                 self._runtime_root(project_id)
                 / "locks"
-                / "project-runtime.lock",
+                / "execution-runtime.lock",
                 timeout_seconds=self.lock_timeout_seconds,
                 shared=True,
             ):

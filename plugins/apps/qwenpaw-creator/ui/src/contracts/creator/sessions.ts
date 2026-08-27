@@ -74,6 +74,12 @@ export interface CreatorSessionView {
   lastMessageSeq: number;
   lastConsumedMessageSeq: number;
   lastEventSeq: number;
+  error?: {
+    code: string;
+    message: string;
+    retryable: boolean;
+    details?: Record<string, unknown>;
+  } | null;
 }
 
 export interface CreatorMessage {
@@ -101,6 +107,8 @@ export interface ConversationPage {
 export interface MessagePage {
   items: CreatorMessage[];
   nextAfter?: number | null;
+  /** Backward cursor: smallest seq of this page when older history exists. */
+  nextBefore?: number | null;
 }
 
 export interface CreatorSessionResponse {

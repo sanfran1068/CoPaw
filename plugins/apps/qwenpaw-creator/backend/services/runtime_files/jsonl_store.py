@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Generic, Iterator, TypeVar, cast
@@ -19,6 +20,7 @@ from pydantic import (
 )
 
 from .atomic_store import (
+    chmod_descriptor_if_supported,
     canonical_json_bytes,
     fsync_directory,
     strict_json_loads,
@@ -30,6 +32,8 @@ from .errors import (
 )
 from .locking import CrossProcessFileLock
 from .models import AwareDatetime, utc_now
+
+logger = logging.getLogger("qwenpaw.creator.runtime_files.jsonl_store")
 
 
 T = TypeVar("T")
@@ -138,12 +142,25 @@ class DurableJsonlStore(Generic[T]):
                 ValueError,
                 PydanticValidationError,
             ) as exc:
+                logger.error(
+                    "jsonl corruption: %s line %d: %s",
+                    self.path,
+                    index,
+                    exc,
+                )
                 raise JsonlCorruptionError(
                     self.path,
                     f"complete line {index} is invalid: {exc}",
                 ) from exc
             expected_seq = len(envelopes) + 1
             if envelope.seq != expected_seq:
+                logger.error(
+                    "jsonl sequence gap: %s line %d seq=%d expected=%d",
+                    self.path,
+                    index,
+                    envelope.seq,
+                    expected_seq,
+                )
                 raise JsonlCorruptionError(
                     self.path,
                     f"line {index} has seq {envelope.seq}, "
@@ -268,7 +285,7 @@ class DurableJsonlStore(Generic[T]):
                 flags |= os.O_CLOEXEC
             descriptor = os.open(self.path, flags, self.mode)
             try:
-                os.fchmod(descriptor, self.mode)
+                chmod_descriptor_if_supported(descriptor, self.mode)
                 view = memoryview(line)
                 while view:
                     written = os.write(descriptor, view)
@@ -284,6 +301,11 @@ class DurableJsonlStore(Generic[T]):
                 os.close(descriptor)
             if not existed:
                 fsync_directory(self.path.parent)
+            logger.debug(
+                "jsonl append: %s seq=%d",
+                self.path,
+                next_seq,
+            )
             return envelope
 
     def read_all(self) -> list[JsonlEnvelope]:

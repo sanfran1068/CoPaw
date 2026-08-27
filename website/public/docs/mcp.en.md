@@ -157,6 +157,27 @@ Tavily is an AI-optimized web search service that enables agents to perform real
 }
 ```
 
+#### Built-in Mail MCP
+
+When mail is configured for a native QwenPaw agent, the system creates and
+enables a `qwenpawmail` MCP driver card in that agent's workspace. The card never
+stores a plaintext credential: it references the encrypted record in the
+workspace's `credentials.yaml`, which QwenPaw resolves into the subprocess
+environment only at startup. The driver starts the `qwenpawmail-mcp` package
+over stdio and also injects the state and workspace directories.
+The client exposes 22 tools for reading, sending, attachments, organization,
+threads, and statistics.
+
+New driver cards use `ask` as their default access policy. You can adjust policy
+by tool and call origin in **Workspace → MCP**. Saving the mail configuration
+again preserves the existing enabled state, tool scope, and access policy.
+
+You do not create this client manually on the general MCP page, but a source
+installation must include the mail package. Load the built-in `mailbox` Skill as
+well so the agent has the account setup, contact, automation, and safety workflow.
+See [Mailbox Management and Automation](./mailbox) for installation, providers,
+tools, and security details.
+
 ---
 
 ### Advanced Options
@@ -210,7 +231,7 @@ QwenPaw provides a set of ready-to-use built-in tools that agents can directly c
 - **Enabled**: Tool is loaded into agent context and can be called in conversations
 - **Disabled**: Tool is not available in agent's tool list and cannot be called
 
-> For optimal performance, enable only the tools you need to reduce context overhead. Configuration changes are hot-reloaded automatically—except switching the Browser stable/experimental track, which requires a service restart.
+> For optimal performance, enable only the tools you need to reduce context overhead. Configuration changes are hot-reloaded automatically—except switching the Browser stable/experimental track, which requires a service restart. See [Browser](./browser).
 
 > **Multi-Agent Support**: Each agent has independent tool configuration. After switching agents in the agent selector at the top of the Console, you'll see that agent's dedicated tool configuration. See [Multi-Agent](./multi-agent) for details.
 
@@ -327,6 +348,8 @@ Configure this option on the `execute_shell_command` tool card (only this tool s
 **Browser Automation**
 
 - `browser(code)`: Execute async Python against QwenPaw's built-in Browser SDK to drive a real browser — navigate, locate elements, act, and read visible page state. The complete SDK API is delivered to the agent automatically on first use.
+  - Works with a standalone browser launched by QwenPaw, or with your own signed-in Chrome (requires the [Chrome extension](./chrome))
+  - See [Browser](./browser) for identities, backends, and every setting
 
 **Screenshots and Images**
 

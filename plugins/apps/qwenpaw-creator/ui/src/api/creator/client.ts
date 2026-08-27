@@ -1,4 +1,5 @@
 import type { CreatorApiError } from "@/contracts/creator";
+import i18n from "@/i18n";
 
 export const CREATOR_API_BASE = "/api/qwenpaw-creator";
 
@@ -11,14 +12,23 @@ export class CreatorHttpError extends Error {
   readonly code: string;
   readonly retryable: boolean;
   readonly details: Record<string, unknown>;
+  readonly errorId?: string;
+  readonly traceId?: string;
+  readonly requestId?: string;
 
   constructor(status: number, error: Partial<CreatorApiError> = {}) {
-    super(error.message || `Creator 请求失败（${status}）`);
+    const message = error.message || i18n.t("api.requestFailed", { status });
+    super(
+      error.errorId ? `${message} （错误编号：${error.errorId}）` : message,
+    );
     this.name = "CreatorHttpError";
     this.status = status;
     this.code = error.code || `HTTP_${status}`;
     this.retryable = error.retryable ?? false;
     this.details = error.details ?? {};
+    this.errorId = error.errorId;
+    this.traceId = error.traceId;
+    this.requestId = error.requestId;
   }
 }
 
@@ -81,6 +91,29 @@ async function errorFrom(response: Response): Promise<CreatorHttpError> {
   } catch {
     body = { message: response.statusText };
   }
+  body.errorId ??= response.headers?.get?.("X-Creator-Error-ID") ?? undefined;
+  body.traceId ??= response.headers?.get?.("X-Creator-Trace-ID") ?? undefined;
+  body.requestId ??= response.headers?.get?.("X-Request-ID") ?? undefined;
+  if (!body.message) {
+    // Keep compatibility with older hosts that still return FastAPI's raw
+    // `detail` payload instead of the Creator diagnostic envelope.
+    const detail = (body as { detail?: unknown }).detail;
+    if (typeof detail === "string") {
+      body = { ...body, message: detail };
+    } else if (Array.isArray(detail)) {
+      const message = detail
+        .map((item) => {
+          const entry = item as { loc?: unknown[]; msg?: string };
+          const loc = Array.isArray(entry.loc)
+            ? entry.loc.filter((part) => part !== "body").join(".")
+            : "";
+          return loc ? `${loc}: ${entry.msg ?? ""}` : entry.msg ?? "";
+        })
+        .filter(Boolean)
+        .join("; ");
+      if (message) body = { ...body, message };
+    }
+  }
   return new CreatorHttpError(response.status, body);
 }
 
@@ -91,6 +124,8 @@ export async function creatorFetch(
   options: { timeoutMs?: number } = {},
 ): Promise<Response> {
   const headers = creatorHeaders(init.headers);
+  const requestId = headers.get("X-Request-ID") || newClientId("request");
+  headers.set("X-Request-ID", requestId);
   if (
     init.body &&
     !(init.body instanceof FormData) &&
@@ -112,6 +147,19 @@ export async function creatorFetch(
   }
   try {
     return await fetch(creatorApiUrl(path), { ...init, headers, signal });
+  } catch (error) {
+    const aborted = error instanceof Error && error.name === "AbortError";
+    throw new CreatorHttpError(aborted ? 408 : 0, {
+      code: aborted ? "CLIENT_TIMEOUT" : "NETWORK_ERROR",
+      message: aborted
+        ? i18n.t("api.requestFailed", { status: 408 })
+        : error instanceof Error
+        ? error.message
+        : i18n.t("api.requestFailed", { status: 0 }),
+      retryable: true,
+      details: { path, requestId },
+      requestId,
+    });
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }

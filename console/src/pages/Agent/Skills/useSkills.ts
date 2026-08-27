@@ -17,6 +17,7 @@ import {
   checkScanWarnings as checkScanWarningsShared,
   showScanErrorModal,
 } from "../../../utils/scanError";
+import { subscribeToSkillChanges } from "../../../utils/skillChangeEvents";
 
 type SkillActionResult =
   | { success: true; name?: string; imported?: string[] }
@@ -72,11 +73,14 @@ export function useSkills() {
     try {
       const result = await harnessApi.listSkills(selectedBackend);
       setProviderSkills(result.skills);
+      if (result.message) {
+        message.warning(result.message);
+      }
     } catch (error) {
       console.warn("Failed to discover Provider Skills:", error);
       setProviderSkills([]);
     }
-  }, [canDiscoverProviderSkills, selectedBackend]);
+  }, [canDiscoverProviderSkills, message, selectedBackend]);
 
   const fetchSkills = useCallback(async () => {
     setLoading(true);
@@ -112,6 +116,16 @@ export function useSkills() {
     invalidateSkillCache({ agentId: selectedAgent });
     void fetchSkills();
   }, [selectedAgent, fetchSkills]);
+
+  useEffect(
+    () =>
+      subscribeToSkillChanges((change) => {
+        if (change.agentId !== selectedAgent) return;
+        invalidateSkillCache({ agentId: selectedAgent });
+        void fetchSkills();
+      }),
+    [fetchSkills, selectedAgent],
+  );
 
   const createSkill = async (
     name: string,

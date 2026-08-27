@@ -30,7 +30,6 @@ import {
   SparkDebugLine,
   SparkEmailLine,
   SparkInternetLine,
-  SparkLocalFileLine,
   SparkMagicWandLine,
   SparkMcpMcpLine,
   SparkMicLine,
@@ -38,7 +37,6 @@ import {
   SparkModifyLine,
   SparkMyApplicationLine,
   SparkOtherLine,
-  SparkPluginLine,
   SparkSaveLine,
   SparkScanLine,
   SparkToolLine,
@@ -48,6 +46,7 @@ import {
 } from "@agentscope-ai/icons";
 import { GitBranch } from "lucide-react";
 import i18next from "i18next";
+import { Files } from "lucide-react";
 import { menuRegistry } from "../../plugins/registry/store";
 import type { MenuItem } from "../../plugins/registry/types";
 
@@ -67,11 +66,11 @@ export const BUILTIN_MENU: MenuItem[] = [
   },
 
   {
-    id: "core.app-center",
+    id: "core.marketplace",
     location: "primary.agentScoped",
-    label: navLabel("nav.apps", "Apps"),
+    label: navLabel("nav.marketplace", "Marketplace"),
     icon: SparkMyApplicationLine,
-    route: "core.app-center",
+    route: "core.marketplace",
     order: 15,
   },
 
@@ -120,45 +119,45 @@ export const BUILTIN_MENU: MenuItem[] = [
     order: 40,
   },
 
-  // agent-group
+  // workspace-group
   {
-    id: "core.agent-group",
+    id: "core.workspace-group",
     location: "primary.agentScoped",
     label: navLabel("nav.agent"),
     isGroup: true,
     order: 30,
   },
   {
-    id: "core.workspace",
+    id: "core.files",
     location: "primary.agentScoped",
-    parentId: "core.agent-group",
-    label: navLabel("nav.workspace"),
-    icon: SparkLocalFileLine,
-    route: "core.workspace",
-    order: 10,
+    parentId: "core.workspace-group",
+    label: navLabel("nav.files"),
+    icon: Files,
+    route: "core.files",
+    order: 5,
   },
   {
     id: "core.skills",
     location: "primary.agentScoped",
-    parentId: "core.agent-group",
+    parentId: "core.workspace-group",
     label: navLabel("nav.skills"),
     icon: SparkMagicWandLine,
     route: "core.skills",
-    order: 20,
+    order: 10,
   },
   {
     id: "core.tools",
     location: "primary.agentScoped",
-    parentId: "core.agent-group",
+    parentId: "core.workspace-group",
     label: navLabel("nav.tools"),
     icon: SparkToolLine,
     route: "core.tools",
-    order: 30,
+    order: 20,
   },
   {
     id: "core.mcp",
     location: "primary.agentScoped",
-    parentId: "core.agent-group",
+    parentId: "core.workspace-group",
     label: navLabel("nav.mcp"),
     icon: SparkMcpMcpLine,
     route: "core.mcp",
@@ -167,7 +166,7 @@ export const BUILTIN_MENU: MenuItem[] = [
   {
     id: "core.acp",
     location: "primary.agentScoped",
-    parentId: "core.agent-group",
+    parentId: "core.workspace-group",
     label: navLabel("nav.acp"),
     icon: SparkScanLine,
     route: "core.acp",
@@ -176,7 +175,7 @@ export const BUILTIN_MENU: MenuItem[] = [
   {
     id: "core.agent-config",
     location: "primary.agentScoped",
-    parentId: "core.agent-group",
+    parentId: "core.workspace-group",
     label: navLabel("nav.agentConfig"),
     icon: SparkModifyLine,
     route: "core.agent-config",
@@ -185,7 +184,7 @@ export const BUILTIN_MENU: MenuItem[] = [
   {
     id: "core.agent-stats",
     location: "primary.agentScoped",
-    parentId: "core.agent-group",
+    parentId: "core.workspace-group",
     label: navLabel("nav.agentStats"),
     icon: SparkBarChartLine,
     route: "core.agent-stats",
@@ -298,15 +297,6 @@ export const BUILTIN_MENU: MenuItem[] = [
     icon: SparkDebugLine,
     route: "core.debug",
     order: 100,
-  },
-  {
-    id: "core.plugin-manager",
-    location: "primary.settings",
-    parentId: "core.settings-group",
-    label: navLabel("nav.pluginManager", "Plugin Manager"),
-    icon: SparkPluginLine,
-    route: "core.plugin-manager",
-    order: 110,
   },
 ];
 

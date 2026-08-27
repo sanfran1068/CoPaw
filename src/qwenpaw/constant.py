@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 # Load .env file from project root before reading any env vars
@@ -110,6 +111,14 @@ else:
         WORKING_DIR = _legacy_copaw_dir.resolve()
     else:
         WORKING_DIR = Path("~/.qwenpaw").expanduser().resolve()
+# Load user-level .env (e.g. ~/.qwenpaw/.env) after WORKING_DIR is resolved.
+# Repo root .env was loaded at the top of this module; it takes precedence
+# over the user-level file because load_dotenv(..., override=False) keeps
+# existing values.
+_user_env_path = WORKING_DIR / ".env"
+if _user_env_path.exists():
+    load_dotenv(_user_env_path)
+
 SECRET_DIR = (
     Path(
         EnvVarLoader.get_str(
@@ -128,6 +137,7 @@ PROJECT_NAME = "QwenPaw"
 
 # Message metadata tags shared across agent middleware and memory managers.
 QWENPAW_MESSAGE_TAG_KEY = "qwenpaw_tag"
+QWENPAW_CLIENT_MESSAGE_ID_KEY = "qwenpaw_client_message_id"
 SCROLL_MEMORY_MESSAGE_TAG = "scroll_memory"
 AUTO_MEMORY_SEARCH_BLOCK_IDS_KEY = "auto_memory_search_block_ids"
 EXTERNAL_USER_QUERY_MESSAGE_TAG = "external_user_query"
@@ -228,6 +238,12 @@ HEARTBEAT_DEFAULT_EVERY = "6h"
 HEARTBEAT_DEFAULT_TARGET = "main"
 HEARTBEAT_DEFAULT_TIMEOUT_SECONDS = 300
 HEARTBEAT_MAX_TIMEOUT_SECONDS = 3600
+
+# Default execution budget for POST /console/chat/task when the request
+# omits ``timeout``. Aligned with Xiaoyi channel task_timeout_ms (1 hour).
+DEFAULT_STREAM_TASK_TIMEOUT_SECONDS = 3600
+# Parent HTTP wait for spawn_subagent foreground (/console/chat).
+DEFAULT_SPAWN_FOREGROUND_TIMEOUT_SECONDS = 600
 HEARTBEAT_TARGET_LAST = "last"
 HEARTBEAT_TARGET_INBOX = "inbox"
 
@@ -380,6 +396,22 @@ LLM_ACQUIRE_TIMEOUT = EnvVarLoader.get_float(
     min_value=10.0,
 )
 
+# Maximum upstream wait (seconds) for the first content-bearing stream chunk.
+# Set to 0 to disable the first-content timeout.
+LLM_STREAM_FIRST_CONTENT_TIMEOUT = EnvVarLoader.get_float(
+    "QWENPAW_LLM_STREAM_FIRST_CONTENT_TIMEOUT",
+    30.0,
+    min_value=0.0,
+)
+
+# Maximum upstream wait (seconds) between later content-bearing stream chunks.
+# Set to 0 to disable the steady-state idle timeout.
+LLM_STREAM_IDLE_TIMEOUT = EnvVarLoader.get_float(
+    "QWENPAW_LLM_STREAM_IDLE_TIMEOUT",
+    30.0,
+    min_value=0.0,
+)
+
 # Tool guard approval timeout (seconds).
 try:
     TOOL_GUARD_APPROVAL_TIMEOUT_SECONDS = max(
@@ -404,6 +436,20 @@ try:
     )
 except (TypeError, ValueError):
     TOOL_GUARD_APPROVAL_HEARTBEAT_INTERVAL = 15.0
+
+# TTL for learned model capability cache entries (seconds).
+# 0 disables expiry. Stale entries from transient upstream failures
+# (e.g. a gateway routing a multimodal model to a text-only backend)
+# are discarded after this duration.
+try:
+    CAPABILITY_CACHE_TTL_SECONDS = max(
+        float(
+            _get_env("QWENPAW_CAPABILITY_CACHE_TTL_SECONDS", "1800"),
+        ),
+        0.0,
+    )
+except (TypeError, ValueError):
+    CAPABILITY_CACHE_TTL_SECONDS = 1800.0
 
 # Marker prepended to every truncation notice.
 # Format:

@@ -6,8 +6,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -24,9 +26,28 @@ from .errors import (
 )
 from .locking import CrossProcessFileLock
 
+logger = logging.getLogger("qwenpaw.creator.runtime_files.atomic_store")
+
 
 T = TypeVar("T")
 WriteStageHook = Callable[[str, Path], None]
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
+    getattr(errno, name)
+    for name in (
+        "EACCES",
+        "EBADF",
+        "EINVAL",
+        "EISDIR",
+        "ENOTSUP",
+        "EOPNOTSUPP",
+        "EPERM",
+    )
+    if hasattr(errno, name)
+}
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _reject_nonfinite_json(value: str) -> None:
@@ -40,17 +61,48 @@ def strict_json_loads(payload: str | bytes | bytearray) -> Any:
 
 
 def fsync_directory(path: str | os.PathLike[str]) -> None:
-    """Persist directory-entry changes on POSIX filesystems."""
+    """Persist directory-entry changes where the platform supports it."""
 
     directory = Path(path)
+    if _is_windows():
+        logger.debug("directory fsync skipped on Windows: %s", directory)
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    descriptor = os.open(directory, flags)
     try:
-        os.fsync(descriptor)
+        descriptor = os.open(directory, flags)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            logger.debug(
+                "directory fsync unsupported for %s: %s",
+                directory,
+                exc,
+            )
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                logger.debug(
+                    "directory fsync unsupported for %s: %s",
+                    directory,
+                    exc,
+                )
+                return
+            raise
     finally:
         os.close(descriptor)
+
+
+def chmod_descriptor_if_supported(descriptor: int, mode: int) -> None:
+    """Apply POSIX fd chmod when available; Windows has no ``os.fchmod``."""
+
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(descriptor, mode)
 
 
 def _json_value(value: Any) -> Any:
@@ -131,7 +183,7 @@ def atomic_replace_bytes(
     if stage_hook is not None:
         stage_hook("temp_created", temporary)
     try:
-        os.fchmod(descriptor, mode)
+        chmod_descriptor_if_supported(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
             handle.write(payload)
@@ -150,6 +202,25 @@ def atomic_replace_bytes(
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _publish_create_if_absent(temporary: Path, path: Path) -> bool:
+    if _is_windows():
+        try:
+            os.rename(temporary, path)
+        except FileExistsError:
+            return False
+        except OSError:
+            if path.exists():
+                return False
+            raise
+        return True
+
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        return False
+    return True
 
 
 def atomic_create_bytes(
@@ -177,9 +248,8 @@ def atomic_create_bytes(
     temporary = Path(raw_temp)
     if stage_hook is not None:
         stage_hook("temp_created", temporary)
-    published = False
     try:
-        os.fchmod(descriptor, mode)
+        chmod_descriptor_if_supported(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
             handle.write(payload)
@@ -187,14 +257,12 @@ def atomic_create_bytes(
             os.fsync(handle.fileno())
         if stage_hook is not None:
             stage_hook("temp_fsynced", temporary)
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
+        if not _publish_create_if_absent(temporary, path):
             return False
-        published = True
         if stage_hook is not None:
             stage_hook("created", path)
-        temporary.unlink()
+        if not _is_windows():
+            temporary.unlink()
         fsync_directory(path.parent)
         if stage_hook is not None:
             stage_hook("directory_fsynced", path.parent)
@@ -203,10 +271,6 @@ def atomic_create_bytes(
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
-        # If publication succeeded and directory fsync failed, the caller must
-        # see the error rather than assume durability.  The complete target may
-        # still be visible and is safe to inspect/recover on restart.
-        del published
 
 
 def durable_unlink(path: str | os.PathLike[str]) -> bool:
@@ -287,6 +351,7 @@ class AtomicJsonRecordStore(Generic[T]):
         try:
             value = strict_json_loads(raw)
         except (UnicodeDecodeError, ValueError) as exc:
+            logger.error("atomic_store corruption: %s: %s", self.path, exc)
             raise CorruptRecordError(self.path, str(exc)) from exc
         validated = self._validate(value, from_disk=True)
         dumped = self._dump_value(validated)
@@ -316,6 +381,7 @@ class AtomicJsonRecordStore(Generic[T]):
                 mode=self.mode,
                 stage_hook=self.stage_hook,
             )
+        logger.debug("atomic_store write: %s", self.path)
         return RecordSnapshot(validated, json_checksum(dumped))
 
     def try_create(self, value: Any) -> RecordSnapshot[T] | None:
@@ -335,7 +401,9 @@ class AtomicJsonRecordStore(Generic[T]):
     def create(self, value: Any) -> RecordSnapshot[T]:
         snapshot = self.try_create(value)
         if snapshot is None:
+            logger.debug("atomic_store create skipped (exists): %s", self.path)
             raise RecordAlreadyExistsError(self.path)
+        logger.debug("atomic_store create: %s", self.path)
         return snapshot
 
     def compare_and_swap(
@@ -353,6 +421,12 @@ class AtomicJsonRecordStore(Generic[T]):
                 current = None
             actual = current.checksum if current is not None else None
             if actual != expected_checksum:
+                logger.warning(
+                    "atomic_store cas conflict: %s expected=%s actual=%s",
+                    self.path,
+                    expected_checksum[:16],
+                    actual[:16] if actual else "none",
+                )
                 raise RecordConflictError(
                     self.path,
                     expected_checksum=expected_checksum,
@@ -364,6 +438,7 @@ class AtomicJsonRecordStore(Generic[T]):
                 mode=self.mode,
                 stage_hook=self.stage_hook,
             )
+        logger.debug("atomic_store cas: %s", self.path)
         return RecordSnapshot(validated, json_checksum(dumped))
 
     def update(
@@ -378,6 +453,12 @@ class AtomicJsonRecordStore(Generic[T]):
                 expected_checksum is not None
                 and current.checksum != expected_checksum
             ):
+                logger.warning(
+                    "atomic_store update conflict: %s expected=%s actual=%s",
+                    self.path,
+                    expected_checksum[:16],
+                    current.checksum[:16],
+                )
                 raise RecordConflictError(
                     self.path,
                     expected_checksum=expected_checksum,
@@ -391,6 +472,7 @@ class AtomicJsonRecordStore(Generic[T]):
                 mode=self.mode,
                 stage_hook=self.stage_hook,
             )
+        logger.debug("atomic_store update: %s", self.path)
         return RecordSnapshot(validated, json_checksum(dumped))
 
     def delete(self, *, expected_checksum: str | None = None) -> None:
@@ -400,6 +482,12 @@ class AtomicJsonRecordStore(Generic[T]):
                 expected_checksum is not None
                 and current.checksum != expected_checksum
             ):
+                logger.warning(
+                    "atomic_store delete conflict: %s expected=%s actual=%s",
+                    self.path,
+                    expected_checksum[:16],
+                    current.checksum[:16],
+                )
                 raise RecordConflictError(
                     self.path,
                     expected_checksum=expected_checksum,
@@ -409,6 +497,7 @@ class AtomicJsonRecordStore(Generic[T]):
                 self.path,
             ):  # pragma: no cover - lock makes this defensive
                 raise RecordNotFoundError(self.path)
+        logger.debug("atomic_store delete: %s", self.path)
 
 
 class CreateIfAbsentJsonStore(Generic[T]):

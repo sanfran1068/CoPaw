@@ -1,3 +1,5 @@
+import type { CreatorSessionStatus } from "./sessions";
+
 export type CreatorScenario = "short_drama" | "video_edit" | "general";
 
 export interface ProjectCreateRequest {
@@ -57,10 +59,37 @@ export interface ProjectSummary {
    * preview button on the home page.
    */
   finalVideoVersionId?: string | null;
+  /** Current session status, null when no runtime session exists. */
+  status?: CreatorSessionStatus | null;
 }
 
 export interface ProjectListResponse {
   items: ProjectSummary[];
   limit: number;
   offset: number;
+}
+
+/** One OSS-hosted inspiration example backed by a built-in Project. */
+export interface InspirationExampleSummary {
+  id: string;
+  title: string;
+  description: string;
+  projectId: string;
+  installed: boolean;
+}
+
+export interface InspirationExampleListResponse {
+  items: InspirationExampleSummary[];
+}
+
+export interface InspirationExampleOpenResponse {
+  projectId: string;
+  installed: boolean;
+}
+
+/** Polled download progress while an example archive streams in from OSS. */
+export interface InspirationExampleOpenProgress {
+  state: "installed" | "downloading" | "idle";
+  receivedBytes?: number;
+  totalBytes?: number | null;
 }

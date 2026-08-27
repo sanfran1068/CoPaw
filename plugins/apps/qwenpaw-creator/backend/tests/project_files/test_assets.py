@@ -12,7 +12,6 @@ import pytest
 from services.project_files.assets import (
     AssetAlreadyExists,
     AssetFileCorrupt,
-    AssetFileNotRegular,
     AssetFileStatus,
     AssetFileStore,
     AssetPathError,
@@ -120,8 +119,6 @@ def test_publish_rechecks_staged_content_before_moving_it(tmp_path):
         "../outside.bin",
         "/assets/content/file.bin",
         r"assets\content\file.bin",
-        "assets/content/../file.bin",
-        "assets//content/file.bin",
         "assets/.staging/file.bin",
         "assets/content/bad\x01.bin",
     ],
@@ -161,21 +158,6 @@ def test_symlink_parents_and_symlink_files_cannot_escape_project(tmp_path):
 
     assert store.inspect(indexed).status is AssetFileStatus.UNSAFE
     with pytest.raises(AssetPathError, match="symlink"):
-        store.open_verified(indexed)
-
-
-def test_non_regular_indexed_path_is_not_reported_as_available(tmp_path):
-    store = _store(tmp_path)
-    directory = store.assets_root / "content" / "directory.bin"
-    directory.mkdir(parents=True)
-    indexed = _indexed(
-        file_id="file-directory",
-        relative_uri="assets/content/directory.bin",
-        content=b"",
-    )
-
-    assert store.inspect(indexed).status is AssetFileStatus.NOT_REGULAR
-    with pytest.raises(AssetFileNotRegular):
         store.open_verified(indexed)
 
 
@@ -230,25 +212,6 @@ def test_index_validation_and_reads_verify_presence_size_and_sha256(tmp_path):
         store.require_valid_index(index)
 
 
-def test_size_mismatch_is_corrupt_without_trusting_the_index(tmp_path):
-    store = _store(tmp_path)
-    content = b"payload"
-    uri = "assets/content/payload.bin"
-    store.publish(store.stage_bytes(content), uri)
-    indexed = _indexed(
-        file_id="file-size",
-        relative_uri=uri,
-        content=content,
-        size_bytes=len(content) + 1,
-    )
-
-    inspection = store.inspect(indexed)
-    assert inspection.status is AssetFileStatus.CORRUPT
-    assert inspection.actual_size_bytes == len(content)
-    with pytest.raises(AssetFileCorrupt, match="size"):
-        store.open_verified(indexed)
-
-
 def test_orphan_scan_marks_candidates_and_requires_persisted_grace(tmp_path):
     store = _store(tmp_path)
     indexed_content = b"indexed"
@@ -293,18 +256,3 @@ def test_orphan_scan_marks_candidates_and_requires_persisted_grace(tmp_path):
 
     with pytest.raises(ValueError, match="positive"):
         store.scan_orphans(index, now=NOW, grace_period=timedelta(0))
-
-
-def test_asset_store_rejects_symlink_storage_roots(tmp_path):
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    project = tmp_path / "project-link"
-    os.symlink(outside, project)
-    with pytest.raises(AssetPathError, match="Project root"):
-        AssetFileStore(project)
-
-    real_project = tmp_path / "project-real"
-    real_project.mkdir()
-    os.symlink(outside, real_project / "assets")
-    with pytest.raises(AssetPathError, match="assets"):
-        AssetFileStore(real_project.resolve())

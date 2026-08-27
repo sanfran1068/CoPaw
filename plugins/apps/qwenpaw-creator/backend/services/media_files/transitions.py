@@ -30,14 +30,42 @@ DEFAULT_TRANSITION_DURATION_SECONDS = 0.4
 # Whitelist of official xfade filter names; crossfade is a common
 # model-side alias and is normalised to fade.
 SUPPORTED_XFADE_KINDS = {
+    # fades
     "fade",
     "fadeblack",
     "fadewhite",
     "dissolve",
+    # directional wipes
     "wipeleft",
+    "wiperight",
+    "wipeup",
+    "wipedown",
+    "wipecircle",
+    "radial",
+    # slides
+    "slideleft",
+    "slideright",
+    "slideup",
+    "slidedown",
+    # shape opens/closes
+    "circlecrop",
+    "circleopen",
+    "circleclose",
+    "rectcrop",
+    "vertopen",
+    "vertclose",
+    "horzopen",
+    "horzclose",
+    # stylised
+    "pixelize",
+    "squeezev",
+    "squeezeh",
+    "zoomin",
 }
 _KIND_ALIASES = {
     "crossfade": "fade",
+    "wipe": "wipeleft",
+    "slide": "slideleft",
     "": "fade",
 }
 
@@ -150,6 +178,7 @@ def build_transition_filter_chain(
             filters.append(
                 f"[{i}:a]aresample=44100,"
                 "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"apad=whole_dur={clip.duration_seconds:.6f},"
                 f"asetpts=PTS-STARTPTS[ai{i}]",
             )
         else:

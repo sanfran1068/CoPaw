@@ -12,9 +12,20 @@ from services.project_files import (
     CanonicalJsonError,
     Project,
     canonical_json_bytes,
+    load_project_document,
     load_project_json,
+    project_document_etag,
     project_etag,
     project_file_bytes,
+)
+from services.project_files.models import (
+    ElementLocation,
+    EntityCollection,
+    R2VCreation,
+    TimelineElement,
+    TimelineSpan,
+    VisualEntity,
+    VisualVariant,
 )
 
 
@@ -73,17 +84,7 @@ def _edit_project() -> Project:
             "label": "Edit Element",
             "enabled": True,
             "span": {"start_tick": 0, "duration_tick": 3000},
-            "location": {
-                "coordinate_space": "normalized_canvas",
-                "x": 0,
-                "y": 0,
-                "width": 1,
-                "height": 1,
-                "anchor_x": 0.5,
-                "anchor_y": 0.5,
-                "rotation_degrees": 0,
-                "opacity": 1,
-            },
+            "location": {},
             "z_index": 0,
             "creation": {
                 "type": "edit",
@@ -114,7 +115,7 @@ def test_project_new_has_complete_valid_defaults_and_utc_time():
         now=datetime(2026, 7, 15, 16, 0, tzinfo=timezone.utc),
     )
 
-    assert project.schema_version == 2
+    assert project.schema_version == 9
     assert project.generation == 0
     assert project.created_at.tzinfo == timezone.utc
     assert project.timelines.order == ["timeline:main"]
@@ -122,23 +123,90 @@ def test_project_new_has_complete_valid_defaults_and_utc_time():
     assert project.assets.files_by_id == {}
 
 
-def test_one_edit_element_selects_exactly_one_source_range():
-    project = _edit_project()
-    creation = (
-        project.timelines.items["timeline:main"]
-        .elements_by_id["element-1"]
-        .creation
+def _variant_project() -> Project:
+    project = Project.new(project_id="project-variants", name="Variants")
+    project.visual.entities = EntityCollection(
+        items={
+            "char:hero": VisualEntity(
+                entity_id="char:hero",
+                kind="character",
+                name="Hero",
+                required_variant_ids=["variant:peak", "variant:fallen"],
+                variants=EntityCollection(
+                    items={
+                        "variant:peak": VisualVariant(
+                            variant_id="variant:peak",
+                        ),
+                        "variant:fallen": VisualVariant(
+                            variant_id="variant:fallen",
+                        ),
+                    },
+                    order=["variant:peak", "variant:fallen"],
+                ),
+            ),
+        },
+        order=["char:hero"],
     )
+    project.timelines.items["timeline:main"].elements_by_id[
+        "element:hero"
+    ] = TimelineElement(
+        element_id="element:hero",
+        span=TimelineSpan(start_tick=0, duration_tick=1_000),
+        location=ElementLocation(),
+        creation=R2VCreation(
+            character_refs=["char:hero"],
+            visual_variant_refs={"char:hero": "variant:fallen"},
+        ),
+    )
+    return Project.model_validate(project.model_dump(mode="json"))
 
-    assert creation.type == "edit"
-    element = project.timelines.items["timeline:main"].elements_by_id[
-        "element-1"
-    ]
-    assert element.render_source is not None
-    assert element.render_source.version_id == "source-version-1"
-    assert element.render_source.source_in_tick == 0
-    assert element.render_source.source_out_tick == 3000
-    assert "plan" not in creation.model_dump(mode="json")
+
+def test_r2v_variant_binding_must_target_a_referenced_entity_and_variant():
+    project = _variant_project()
+    raw = project.model_dump(mode="json")
+    creation = raw["timelines"]["items"]["timeline:main"]["elements_by_id"][
+        "element:hero"
+    ]["creation"]
+
+    creation["visual_variant_refs"] = {
+        "char:hero": "variant:missing",
+    }
+    with pytest.raises(
+        ValidationError,
+        match="element element:hero: .*missing variant variant:missing",
+    ):
+        Project.model_validate(raw)
+
+    creation["visual_variant_refs"] = {
+        "char:other": "variant:fallen",
+    }
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "element element:hero: .*unreferenced entity char:other; "
+            "add it to this creation's character_refs"
+        ),
+    ):
+        Project.model_validate(raw)
+
+
+def test_visual_variants_must_be_declared_in_required_variant_ids():
+    with pytest.raises(
+        ValidationError,
+        match="must be declared in required_variant_ids",
+    ):
+        VisualEntity(
+            entity_id="char:hero",
+            kind="character",
+            name="Hero",
+            required_variant_ids=[],
+            variants=EntityCollection(
+                items={
+                    "variant:peak": VisualVariant(variant_id="variant:peak"),
+                },
+                order=["variant:peak"],
+            ),
+        )
 
 
 def test_canonical_serialization_is_stable_human_readable_and_round_trips():
@@ -154,6 +222,56 @@ def test_canonical_serialization_is_stable_human_readable_and_round_trips():
     assert first.index(b'"schema_version"') < first.index(b'"project_id"')
     assert load_project_json(first) == project
     assert project_etag(load_project_json(first)) == project_etag(project)
+
+
+def test_legacy_document_etag_survives_in_memory_schema_migration():
+    project = Project.new(
+        project_id="project-legacy",
+        name="Legacy",
+        now=datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc),
+    )
+    project.visual.entities = EntityCollection(
+        items={
+            "char:hero": VisualEntity(
+                entity_id="char:hero",
+                kind="character",
+                name="Hero",
+                required_variant_ids=["variant:peak"],
+                variants=EntityCollection(
+                    items={
+                        "variant:peak": VisualVariant(
+                            variant_id="variant:peak",
+                        ),
+                    },
+                    order=["variant:peak"],
+                ),
+            ),
+        },
+        order=["char:hero"],
+    )
+    raw = Project.model_validate(project.model_dump(mode="json")).model_dump(
+        mode="json",
+    )
+    raw["schema_version"] = 3
+    del raw["visual"]["entities"]["items"]["char:hero"]["required_variant_ids"]
+    # Legacy documents predate the character voice field entirely.
+    del raw["visual"]["entities"]["items"]["char:hero"]["voice"]
+
+    migrated = load_project_document(raw)
+
+    assert migrated.schema_version == 9
+    assert migrated.visual.entities.items[
+        "char:hero"
+    ].required_variant_ids == ["variant:peak"]
+    assert project_document_etag(raw, project=migrated) == (
+        # Pinned against the current schema dump: bump when Project gains
+        # fields, the mechanism under test is that migration-added fields
+        # stay out of the source-document hash.
+        "sha256:64744d1ed0c8209fb9b616e416c46f6b8f5a4dc89e56bd1de87e294dfa0d68db"
+    )
+    assert project_document_etag(raw, project=migrated) != project_etag(
+        migrated,
+    )
 
 
 def test_dynamic_map_keys_are_sorted_but_business_order_is_preserved():
@@ -182,60 +300,39 @@ def test_indexed_file_uri_must_name_a_file_below_assets(relative_uri):
         Project.model_validate(raw)
 
 
-def test_graph_rejects_edit_element_with_missing_source_version():
-    raw = Project.new(project_id="project-bad", name="Bad").model_dump(
-        mode="json",
-    )
-    raw["timelines"]["items"]["timeline:main"]["elements_by_id"]["bad"] = {
-        "element_id": "bad",
-        "span": {"start_tick": 0, "duration_tick": 1000},
-        "location": {
-            "coordinate_space": "normalized_canvas",
-            "x": 0,
-            "y": 0,
-            "width": 1,
-            "height": 1,
-            "anchor_x": 0.5,
-            "anchor_y": 0.5,
-            "rotation_degrees": 0,
-            "opacity": 1,
-        },
-        "creation": {
-            "type": "edit",
-            "intent": "",
-            "reason": "",
-            "original_sound": "preserve",
-            "source_intelligence_version_id": None,
-        },
-        "render_source": {
-            "type": "source_asset_version",
-            "version_id": "missing",
-            "source_in_tick": 0,
-            "source_out_tick": 1000,
-            "playback_rate": 1,
-            "loop": False,
-        },
-    }
-
-    with pytest.raises(
-        ValidationError,
-        match="Element render source references missing",
-    ):
-        Project.model_validate(raw)
-
-
 def test_project_json_is_plain_json_with_no_runtime_state():
     payload = json.loads(project_file_bytes(_edit_project()))
 
     assert "runtime" not in payload
     assert "reviews" not in payload
-    creation = payload["timelines"]["items"]["timeline:main"][
-        "elements_by_id"
-    ]["element-1"]["creation"]
-    assert set(creation) == {
-        "type",
-        "intent",
-        "reason",
-        "original_sound",
-        "source_intelligence_version_id",
+
+
+def test_fabricated_artifact_slots_are_rejected():
+    """Hand-written slots (unknown kind or empty shell) must not validate.
+
+    Reproduces the 2026-08 incident: the model fabricated video slots via
+    jq_project (kind ``r2v_video``, no versions) to claim completion, and
+    the real pipeline write-back later collided with them.
+    """
+
+    raw = Project.new(project_id="project-1", name="Initial").model_dump(
+        mode="json",
+    )
+    raw["assets"]["artifact_slots_by_id"]["element:el:x:main"] = {
+        "slot_id": "element:el:x:main",
+        "kind": "r2v_video",
+        "owner_ref": "element:el:x",
+        "version_ids": [],
+        "selected_version_id": None,
+        "metadata": {},
     }
+    with pytest.raises(ValidationError, match="unknown kind"):
+        Project.model_validate(raw)
+
+    # A known kind with no versions is still an empty shell no pipeline
+    # ever writes.
+    raw["assets"]["artifact_slots_by_id"]["element:el:x:main"][
+        "kind"
+    ] = "element_video"
+    with pytest.raises(ValidationError, match="no artifact"):
+        Project.model_validate(raw)

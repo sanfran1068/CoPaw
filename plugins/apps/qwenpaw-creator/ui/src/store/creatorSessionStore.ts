@@ -22,6 +22,7 @@ import {
   isTechnicalControlText,
   isUserAuthorityMessage,
 } from "@/lib/creatorMessagePresentation";
+import i18n from "@/i18n";
 
 const conversationRetryIds = new Map<string, string>();
 
@@ -51,8 +52,10 @@ export interface StreamingAssistantMessage {
   toolCall?: {
     id: string;
     name: string;
-    argumentDeltas: Record<number, string>;
     arguments?: Record<string, unknown>;
+    receivedBytes?: number;
+    providerChunkCount?: number;
+    argumentStreamComplete?: boolean;
   };
   createdAt: string;
 }
@@ -76,8 +79,10 @@ export interface SubagentStreamTool {
   tool: string;
   firstEventSeq: number;
   status: "started" | "succeeded" | "failed";
-  argumentDeltas?: Record<number, string>;
   arguments?: Record<string, unknown>;
+  receivedBytes?: number;
+  providerChunkCount?: number;
+  argumentStreamComplete?: boolean;
   result?: unknown;
   state?: string;
   taskId?: string;
@@ -97,11 +102,18 @@ export interface SubagentActivity {
   targetRefs: string[];
   firstEventSeq: number;
   completed: boolean;
+  waitingReview?: boolean;
   terminalKind?: "SUCCESS" | "BLOCKED" | "FAILED" | "STALE" | "CANCELLED";
   summaryText?: string;
   terminalEventSeq?: number;
   messages: Record<string, SubagentStreamMessage>;
   tools: Record<string, SubagentStreamTool>;
+}
+
+export interface RateLimitRetryState {
+  attempt: number;
+  maxAttempts: number;
+  runId: string;
 }
 
 interface CreatorSessionState {
@@ -124,6 +136,7 @@ interface CreatorSessionState {
   isReplaying: boolean;
   error: string | null;
   stream: CreatorEventStream | null;
+  rateLimitRetry: RateLimitRetryState | null;
   bootstrap: (projectId: string) => Promise<void>;
   setConversation: (conversationId: string) => Promise<void>;
   newConversation: () => Promise<string>;
@@ -225,6 +238,7 @@ function subagentActivityBase(
       ? event.seq
       : existing?.firstEventSeq ?? event.seq,
     completed: runChanged ? false : existing?.completed ?? false,
+    waitingReview: runChanged ? undefined : existing?.waitingReview,
     terminalKind: runChanged ? undefined : existing?.terminalKind,
     summaryText: runChanged ? undefined : existing?.summaryText,
     terminalEventSeq: runChanged ? undefined : existing?.terminalEventSeq,
@@ -292,6 +306,19 @@ function subagentSummary(event: CreatorEvent): string | undefined {
   return undefined;
 }
 
+function isLegacyReviewPause(
+  terminalKind: SubagentActivity["terminalKind"],
+  summary: string | undefined,
+): boolean {
+  // Runs created before Runtime emitted waitingReview used a plain BLOCKED
+  // event. Keep those durable histories neutral while all new events rely on
+  // the structured flag.
+  return (
+    terminalKind === "BLOCKED" &&
+    Boolean(summary && /等待(?:用户)?审阅|审阅通过后/u.test(summary))
+  );
+}
+
 function settleSubagentMessages(
   activity: SubagentActivity,
   runId: string,
@@ -335,6 +362,7 @@ function defaultState() {
     isReplaying: false,
     error: null,
     stream: null as CreatorEventStream | null,
+    rateLimitRetry: null as RateLimitRetryState | null,
   };
 }
 
@@ -418,7 +446,10 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
         after ?? initial.messages.at(-1)?.messageSeq ?? 0,
       );
       while (expectedEpoch === messageRefreshEpoch) {
-        const page = await listMessages(projectId, conversationId, cursor, 500);
+        const page = await listMessages(projectId, conversationId, {
+          after: cursor,
+          limit: 500,
+        });
         const current = get();
         if (
           expectedEpoch !== messageRefreshEpoch ||
@@ -594,12 +625,12 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
               },
             ];
           }
-          const page = await listMessages(
-            projectId,
-            activeConversationId,
-            0,
-            50,
-          );
+          // The newest page anchors the conversation; older history loads
+          // backward on demand (scroll-up in AgentDock).
+          const page = await listMessages(projectId, activeConversationId, {
+            tail: true,
+            limit: 50,
+          });
           if (
             bootstrapGeneration !== lifecycleGeneration ||
             get().projectId !== projectId
@@ -629,7 +660,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                 current.streamingAssistantMessages,
                 messages,
               ),
-              hasMoreMessages: page.nextAfter != null,
+              hasMoreMessages: page.nextBefore != null,
               lastEventSeq: resumeAfter,
               loading: false,
               stopping: false,
@@ -711,7 +742,10 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
           loadingOlder: true,
         });
         try {
-          const page = await listMessages(projectId, conversationId, 0, 50);
+          const page = await listMessages(projectId, conversationId, {
+            tail: true,
+            limit: 50,
+          });
           set((current) => {
             if (
               current.projectId !== projectId ||
@@ -720,7 +754,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
               return {};
             return {
               messages: page.items,
-              hasMoreMessages: page.nextAfter != null,
+              hasMoreMessages: page.nextBefore != null,
               loadingOlder: false,
             };
           });
@@ -745,7 +779,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
 
       newConversation: async () => {
         const { projectId, activeConversationId } = get();
-        if (!projectId) throw new Error("Creator Session 尚未初始化");
+        if (!projectId) throw new Error(i18n.t("store.sessionNotInit"));
         const created = await createStableConversation(projectId);
         if (
           get().projectId !== projectId ||
@@ -780,15 +814,19 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
         const { projectId, activeConversationId, messages, loadingOlder } =
           get();
         if (!projectId || !activeConversationId || loadingOlder) return;
-        const latest = messages.at(-1)?.messageSeq ?? 0;
+        // Page backward from the oldest durable message already loaded; the
+        // initial tail page comes from bootstrap/setConversation.
+        const oldest = messages[0]?.messageSeq;
+        if (!oldest || oldest <= 1) {
+          set({ hasMoreMessages: false });
+          return;
+        }
         set({ loadingOlder: true });
         try {
-          const page = await listMessages(
-            projectId,
-            activeConversationId,
-            latest,
-            50,
-          );
+          const page = await listMessages(projectId, activeConversationId, {
+            before: oldest,
+            limit: 50,
+          });
           set((state) => {
             if (
               state.projectId !== projectId ||
@@ -802,7 +840,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                 state.streamingAssistantMessages,
                 messages,
               ),
-              hasMoreMessages: page.nextAfter != null,
+              hasMoreMessages: page.nextBefore != null,
               loadingOlder: false,
             };
           });
@@ -833,7 +871,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
       sendMessage: async (input) => {
         const { projectId, session, activeConversationId } = get();
         if (!projectId || !session || !activeConversationId)
-          throw new Error("Creator Session 尚未初始化");
+          throw new Error(i18n.t("store.sessionNotInit"));
         const text =
           input.message ??
           input.content?.find((part) => part.type === "text")?.text ??
@@ -896,12 +934,10 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
             };
           });
           if (accepted.appendState === "appended") {
-            const page = await listMessages(
-              projectId,
-              activeConversationId,
-              Math.max(0, accepted.messageSeq - 1),
-              1,
-            );
+            const page = await listMessages(projectId, activeConversationId, {
+              after: Math.max(0, accepted.messageSeq - 1),
+              limit: 1,
+            });
             set((state) => {
               if (
                 state.projectId !== projectId ||
@@ -989,12 +1025,13 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
           let subagentActivities = current.subagentActivities;
           let queuedUi = current.queuedUi;
           let session = current.session;
+          let rateLimitRetry = current.rateLimitRetry;
           accepted.forEach((event) => {
             const actionId = eventString(event.data, "actionId");
             const subagentDetail =
               event.type === "subagent.message_delta" ||
               event.type === "subagent.message_completed" ||
-              event.type === "subagent.tool_delta" ||
+              event.type === "subagent.tool_progress" ||
               event.type === "subagent.tool_started" ||
               event.type === "subagent.tool_completed";
             const subagentLifecycle = SUBAGENT_LIFECYCLE_EVENTS.has(event.type);
@@ -1026,6 +1063,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                 activity = {
                   ...activity,
                   completed: false,
+                  waitingReview: undefined,
                   terminalKind: undefined,
                   summaryText: undefined,
                   terminalEventSeq: undefined,
@@ -1033,6 +1071,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
               }
               const terminalKind = subagentTerminalKind(event);
               if (terminalKind) {
+                const summary = subagentSummary(event) ?? activity.summaryText;
                 activity = settleSubagentMessages(
                   activity,
                   activity.runId,
@@ -1041,8 +1080,11 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                 activity = {
                   ...activity,
                   completed: true,
+                  waitingReview:
+                    event.data.waitingReview === true ||
+                    isLegacyReviewPause(terminalKind, summary),
                   terminalKind,
-                  summaryText: subagentSummary(event) ?? activity.summaryText,
+                  summaryText: summary,
                   terminalEventSeq: event.seq,
                 };
               }
@@ -1161,7 +1203,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
               }
 
               if (
-                event.type === "subagent.tool_delta" ||
+                event.type === "subagent.tool_progress" ||
                 event.type === "subagent.tool_started" ||
                 event.type === "subagent.tool_completed"
               ) {
@@ -1171,40 +1213,9 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                 if (toolCallId && runId) {
                   const toolKey = `${runId}:${toolCallId}`;
                   const existingTool = activity.tools[toolKey];
-                  let argumentDeltas = existingTool?.argumentDeltas ?? {};
-                  if (event.type === "subagent.tool_delta") {
-                    const deltaIndex = Number(event.data.deltaIndex);
-                    const argumentsDelta = event.data.argumentsDelta;
-                    if (
-                      Number.isInteger(deltaIndex) &&
-                      deltaIndex >= 0 &&
-                      typeof argumentsDelta === "string" &&
-                      !(deltaIndex in argumentDeltas)
-                    ) {
-                      argumentDeltas = {
-                        ...argumentDeltas,
-                        [deltaIndex]: argumentsDelta,
-                      };
-                    }
-                  }
-                  let parsedArguments = isRecord(event.data.arguments)
+                  const parsedArguments = isRecord(event.data.arguments)
                     ? event.data.arguments
                     : existingTool?.arguments;
-                  if (
-                    !parsedArguments &&
-                    Object.keys(argumentDeltas).length > 0
-                  ) {
-                    const rawArguments = Object.entries(argumentDeltas)
-                      .sort(([left], [right]) => Number(left) - Number(right))
-                      .map(([, value]) => value)
-                      .join("");
-                    try {
-                      const candidate = JSON.parse(rawArguments) as unknown;
-                      if (isRecord(candidate)) parsedArguments = candidate;
-                    } catch {
-                      // Partial JSON stays visible until deltas complete it.
-                    }
-                  }
                   const nextTool: SubagentStreamTool = {
                     toolCallId,
                     runId,
@@ -1217,8 +1228,19 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                       event.type !== "subagent.tool_completed"
                         ? "started"
                         : subagentToolStatus(event.data.state),
-                    argumentDeltas,
                     arguments: parsedArguments,
+                    receivedBytes:
+                      typeof event.data.receivedBytes === "number"
+                        ? event.data.receivedBytes
+                        : existingTool?.receivedBytes,
+                    providerChunkCount:
+                      typeof event.data.providerChunkCount === "number"
+                        ? event.data.providerChunkCount
+                        : existingTool?.providerChunkCount,
+                    argumentStreamComplete:
+                      typeof event.data.complete === "boolean"
+                        ? event.data.complete
+                        : existingTool?.argumentStreamComplete,
                     result:
                       event.type === "subagent.tool_completed"
                         ? event.data.result
@@ -1263,8 +1285,10 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
             }
             if (
               event.type === "agent.run.failed" ||
-              event.type === "agent.run.cancelled"
+              event.type === "agent.run.cancelled" ||
+              event.type === "agent.run.completed"
             ) {
+              rateLimitRetry = null;
               const terminalRunId = eventString(event.data, "runId");
               if (terminalRunId) {
                 const remaining = Object.fromEntries(
@@ -1279,8 +1303,42 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                   streamingAssistantMessages = remaining;
                 }
               }
+              if (event.type === "agent.run.failed" && session) {
+                const errorPayload = event.data.error as
+                  | {
+                      code?: string;
+                      message?: string;
+                      retryable?: boolean;
+                      details?: Record<string, unknown>;
+                    }
+                  | undefined;
+                if (errorPayload?.message) {
+                  session = {
+                    ...session,
+                    error: errorPayload as {
+                      code: string;
+                      message: string;
+                      retryable: boolean;
+                      details?: Record<string, unknown>;
+                    },
+                  };
+                }
+              }
+            }
+            if (event.type === "agent.model.rate_limit_retry") {
+              const attempt = Number(event.data.attempt);
+              const maxAttempts = Number(event.data.maxAttempts);
+              if (Number.isFinite(attempt) && Number.isFinite(maxAttempts)) {
+                rateLimitRetry = {
+                  attempt,
+                  maxAttempts,
+                  runId: eventString(event.data, "runId") ?? "",
+                };
+              }
             }
             if (event.type === "agent.message_delta") {
+              // The model answered again, so any throttling notice is stale.
+              rateLimitRetry = null;
               const messageId =
                 typeof event.data.messageId === "string"
                   ? event.data.messageId
@@ -1333,43 +1391,16 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                 }
               }
             }
-            if (event.type === "agent.tool_delta") {
+            if (event.type === "agent.tool_progress") {
               const messageId = eventString(event.data, "messageId");
               const toolCallId = eventString(event.data, "toolCallId");
               const toolName = eventString(event.data, "tool");
-              const deltaIndex = Number(event.data.deltaIndex);
-              const argumentsDelta = event.data.argumentsDelta;
               const alreadyDurable = messageId
                 ? messages.some((message) => message.messageId === messageId)
                 : false;
-              if (
-                messageId &&
-                toolCallId &&
-                toolName &&
-                Number.isInteger(deltaIndex) &&
-                deltaIndex >= 0 &&
-                typeof argumentsDelta === "string" &&
-                !alreadyDurable
-              ) {
+              if (messageId && toolCallId && toolName && !alreadyDurable) {
                 const existing = streamingAssistantMessages[messageId];
                 const currentTool = existing?.toolCall;
-                const argumentDeltas = {
-                  ...(currentTool?.id === toolCallId
-                    ? currentTool.argumentDeltas
-                    : {}),
-                  [deltaIndex]: argumentsDelta,
-                };
-                const rawArguments = Object.entries(argumentDeltas)
-                  .sort(([left], [right]) => Number(left) - Number(right))
-                  .map(([, value]) => value)
-                  .join("");
-                let parsedArguments: Record<string, unknown> | undefined;
-                try {
-                  const candidate = JSON.parse(rawArguments) as unknown;
-                  if (isRecord(candidate)) parsedArguments = candidate;
-                } catch {
-                  // Partial provider JSON is retained in argumentDeltas.
-                }
                 streamingAssistantMessages = {
                   ...streamingAssistantMessages,
                   [messageId]: {
@@ -1381,8 +1412,22 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                     toolCall: {
                       id: toolCallId,
                       name: toolName,
-                      argumentDeltas,
-                      arguments: parsedArguments,
+                      arguments:
+                        currentTool?.id === toolCallId
+                          ? currentTool.arguments
+                          : undefined,
+                      receivedBytes:
+                        typeof event.data.receivedBytes === "number"
+                          ? event.data.receivedBytes
+                          : currentTool?.receivedBytes,
+                      providerChunkCount:
+                        typeof event.data.providerChunkCount === "number"
+                          ? event.data.providerChunkCount
+                          : currentTool?.providerChunkCount,
+                      argumentStreamComplete:
+                        typeof event.data.complete === "boolean"
+                          ? event.data.complete
+                          : currentTool?.argumentStreamComplete,
                     },
                     createdAt: existing?.createdAt ?? event.at,
                   },
@@ -1486,6 +1531,7 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                   status === "CANCELLED" ||
                   status === "ERROR"
                 ) {
+                  rateLimitRetry = null;
                   Object.entries(subagentActivities).forEach(
                     ([key, activity]) => {
                       if (activity.completed) return;
@@ -1495,7 +1541,8 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
                           ...activity,
                           completed: true,
                           terminalKind: "CANCELLED" as const,
-                          summaryText: activity.summaryText ?? "用户中止",
+                          summaryText:
+                            activity.summaryText ?? i18n.t("store.userAbort"),
                           terminalEventSeq: event.seq,
                         },
                       };
@@ -1526,6 +1573,9 @@ export const useCreatorSessionStore = create<CreatorSessionState>(
           }
           if (queuedUi !== current.queuedUi) patch.queuedUi = queuedUi;
           if (session !== current.session) patch.session = session;
+          if (rateLimitRetry !== current.rateLimitRetry) {
+            patch.rateLimitRetry = rateLimitRetry;
+          }
           return patch;
         });
         if (messageRefreshAfter != null)

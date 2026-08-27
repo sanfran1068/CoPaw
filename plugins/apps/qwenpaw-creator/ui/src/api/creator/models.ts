@@ -8,6 +8,7 @@ import { creatorRequest, hostToken, jsonBody, newClientId } from "./client";
 export interface HostModelInfo {
   id: string;
   name: string;
+  is_free?: boolean;
 }
 
 export interface HostProviderInfo {
@@ -17,6 +18,9 @@ export interface HostProviderInfo {
   freeze_url: boolean;
   models: HostModelInfo[];
   extra_models: HostModelInfo[];
+  api_key?: string;
+  require_api_key?: boolean;
+  is_free_tier?: boolean;
   meta?: {
     base_url_options?: { label: string; value: string }[];
   };
@@ -47,7 +51,15 @@ export function getModelConfig(): Promise<ModelConfigData> {
 }
 
 export interface ResolvedModels {
-  video: { provider: string; model: string };
+  video: {
+    provider: string;
+    model: string;
+    known?: boolean;
+    supportedModes?: string[];
+    /** Per-mode derived names — what a t2v/i2v element actually bills. */
+    byMode?: Record<string, string>;
+  };
+  s2v?: { model: string };
 }
 
 /**
@@ -57,6 +69,48 @@ export interface ResolvedModels {
  */
 export function getResolvedModels(): Promise<ResolvedModels> {
   return creatorRequest("/models/resolved");
+}
+
+export interface VideoModelCapabilities {
+  provider: string;
+  model: string;
+  known: boolean;
+  supportedModes: string[];
+  effectiveModels: Record<string, string>;
+  derivesModeModel: boolean;
+  documentationUrl: string;
+}
+
+/** Backend-owned exact capability lookup; performs no provider request. */
+export function getVideoCapabilities(
+  modelName: string,
+  protocol: string,
+): Promise<VideoModelCapabilities> {
+  const query = new URLSearchParams({ modelName, protocol });
+  return creatorRequest(`/models/video-capabilities?${query.toString()}`);
+}
+
+export interface TtsModelCapability {
+  model: string;
+  label: string;
+  family: "qwen-tts" | "cosyvoice";
+  transport: "http" | "websocket";
+  systemVoices: string[];
+  supportsDesign: boolean;
+}
+
+export interface TtsCapabilities {
+  default: string;
+  models: TtsModelCapability[];
+}
+
+/**
+ * Speech models this backend build supports. The configuration UI renders its
+ * choices from here so it never offers a model the backend cannot drive, and
+ * so it knows which models need a designed voice before they can speak.
+ */
+export function getTtsCapabilities(): Promise<TtsCapabilities> {
+  return creatorRequest("/models/tts-capabilities");
 }
 
 export function saveModelConfig(
@@ -99,6 +153,64 @@ export function patchExecutionAuthorization(
     method: "PATCH",
     headers: { "Idempotency-Key": id },
     body: jsonBody({ mode }),
+  });
+}
+
+export function patchCreationCheckpoints(
+  mode: "required" | "skip",
+  executionMode: "delegated" | "co_creation" | "fine_tuning" = "co_creation",
+): Promise<{ ok: boolean }> {
+  const id = newClientId("creation-checkpoints");
+  return creatorRequest("/models/config/creation-checkpoints", {
+    method: "PATCH",
+    headers: { "Idempotency-Key": id },
+    body: jsonBody({ mode, execution_mode: executionMode }),
+  });
+}
+
+export function patchMediaReview(
+  mode: "required" | "auto_approve",
+): Promise<{ ok: boolean }> {
+  const id = newClientId("media-review");
+  return creatorRequest("/models/config/media-review", {
+    method: "PATCH",
+    headers: { "Idempotency-Key": id },
+    body: jsonBody({ mode }),
+  });
+}
+
+export function patchPermissionMode(mode: {
+  execution: "required" | "allow_all";
+  checkpoints: "required" | "skip";
+  mediaReview: "required" | "auto_approve";
+}): Promise<{ ok: boolean }> {
+  const id = newClientId("permission-mode");
+  return creatorRequest("/models/config/permission-mode", {
+    method: "PATCH",
+    headers: { "Idempotency-Key": id },
+    body: jsonBody({
+      execution_authorization: mode.execution,
+      creation_checkpoints: mode.checkpoints,
+      media_review: mode.mediaReview,
+    }),
+  });
+}
+
+export function patchSelfReview(
+  tiers: Partial<{
+    sync_enabled: boolean;
+    media_enabled: boolean;
+    render_enabled: boolean;
+    // Explicit boolean persists a user choice; null restores auto
+    // (能开尽开) for that operator.
+    operators: Record<string, boolean | null>;
+  }>,
+): Promise<{ ok: boolean }> {
+  const id = newClientId("self-review");
+  return creatorRequest("/models/config/self-review", {
+    method: "PATCH",
+    headers: { "Idempotency-Key": id },
+    body: jsonBody(tiers),
   });
 }
 

@@ -243,105 +243,107 @@ def test_reconcile_reclaims_a_queued_run_bound_to_a_terminal_goal(
     assert session.error is None
 
 
-def test_supersede_with_foreign_expected_run_spares_the_active_run(
+def test_stalled_interrupt_reclaims_a_running_run_with_no_live_owner(
     tmp_path,
 ) -> None:
-    """A supersede aimed at a dead run must not kill its replacement.
+    """A dead worker's RUNNING run must not park the stop forever.
 
-    The messages API fires the supersede after admission, but the
-    dispatcher may have already started the run for that very message;
-    cancelling it would consume the message and wedge the Session.
+    Production wedge: the mainline failed on stream persistence and the
+    FAILED transition itself lost the Runtime lock race, leaving the run
+    durably RUNNING with no owner. Every reconcile pass treated it as a
+    foreign live lease, so the Session stayed INTERRUPT_REQUESTED and the
+    dock showed 「正在停止所有 Agent」 indefinitely while user messages
+    piled up unconsumed. After the stall window the stop must be served.
     """
 
-    release = asyncio.Event()
-
     async def callback(_messages, _tools) -> AgentModelTurn:
-        await release.wait()
-        return AgentModelTurn(content="完成")
+        return AgentModelTurn(content="不应被调用")
 
     async def scenario():
-        services = _create_project(tmp_path, initial_goal="第一个任务")
-        driver = FileCreatorAgentRuntime(
-            services,
-            model_client=CallbackAgentChatClient(callback),
-            poll_interval_seconds=0.01,
-        )
-        await driver.start()
-        driver.notify(PROJECT_ID)
-        await _wait_for(
-            lambda: services.sessions.get_project_session(
-                PROJECT_ID,
-            ).active_run_id
-            is not None,
-        )
-        spared = await driver.interrupt(
+        services = _create_project(tmp_path, initial_goal=None)
+        appended = services.sessions.append_message(
             PROJECT_ID,
-            superseded=True,
-            expected_run_id="agent-run-somebody-else",
+            SESSION_ID,
+            CONVERSATION_ID,
+            role="user",
+            content_parts=[{"type": "text", "text": "生成镜头视频"}],
+        ).message
+        goal = services.sessions.create_goal(
+            PROJECT_ID,
+            SESSION_ID,
+            CONVERSATION_ID,
+            root_message_seq=appended.message_seq,
+            intent="生成镜头视频",
+            goal_id="goal-dead-owner",
         )
-        release.set()
+        snapshot = services.projects.read(PROJECT_ID)
         runs = CreatorAgentRunStore(services.root)
-        await _wait_for(
-            lambda: any(
-                run.status.value == "SUCCEEDED"
-                for run in runs.list(PROJECT_ID)
+        runs.create(
+            CreatorAgentRunRecord(
+                run_id="agent-run-dead-owner",
+                project_id=PROJECT_ID,
+                session_id=SESSION_ID,
+                goal_id=goal.goal_id,
+                conversation_id=CONVERSATION_ID,
+                round_id="round-dead-owner",
+                caused_by_message_id=appended.message_id,
+                caused_by_message_seq=appended.message_seq,
+                origin=ChangeOrigin.AGENTDOCK_IDLE_GOAL,
+                review_policy=ReviewPolicy.AUTO_FIX,
+                input_generation=snapshot.generation,
+                input_etag=snapshot.etag,
             ),
         )
-        await driver.wait_until_idle(PROJECT_ID)
-        records = runs.list(PROJECT_ID)
-        await driver.stop()
-        return spared, records
-
-    spared, records = asyncio.run(scenario())
-
-    assert spared is False
-    assert [record.status.value for record in records] == ["SUCCEEDED"]
-
-
-def test_reconcile_returns_a_wedged_resuming_session_to_idle(
-    tmp_path,
-) -> None:
-    """RESUMING with nothing pending and no run self-heals to IDLE."""
-
-    async def callback(_messages, _tools) -> AgentModelTurn:
-        return AgentModelTurn(content="完成")
-
-    async def scenario():
-        services = _create_project(tmp_path, initial_goal="第一个任务")
-        driver = FileCreatorAgentRuntime(
-            services,
-            model_client=CallbackAgentChatClient(callback),
-            poll_interval_seconds=0.01,
+        services.sessions.activate_run(
+            PROJECT_ID,
+            SESSION_ID,
+            goal_id=goal.goal_id,
+            run_id="agent-run-dead-owner",
         )
-        await driver.start()
-        driver.notify(PROJECT_ID)
-        runs = CreatorAgentRunStore(services.root)
-        await _wait_for(
-            lambda: any(
-                run.status.value == "SUCCEEDED"
-                for run in runs.list(PROJECT_ID)
-            ),
+        runs.transition(
+            PROJECT_ID,
+            "agent-run-dead-owner",
+            expected_status="QUEUED",
+            status="RUNNING",
         )
-        await driver.wait_until_idle(PROJECT_ID)
-        # The wedge left behind by a supersede that consumed its own
-        # replacement message: RESUMING, no active run, nothing pending.
+        # The worker dies here without persisting a terminal status; the
+        # user presses stop and keeps typing into the unresponsive dock.
         services.sessions.set_session_status(
             PROJECT_ID,
             SESSION_ID,
-            "RESUMING",
+            "INTERRUPT_REQUESTED",
         )
+        services.sessions.append_message(
+            PROJECT_ID,
+            SESSION_ID,
+            CONVERSATION_ID,
+            role="user",
+            content_parts=[{"type": "text", "text": "还在吗？"}],
+        )
+
+        driver = FileCreatorAgentRuntime(
+            services,
+            model_client=CallbackAgentChatClient(callback),
+            poll_interval_seconds=0.01,
+        )
+        driver._INTERRUPT_STALL_RECLAIM_SECONDS = 0.0
+        await driver.start()
         driver.notify(PROJECT_ID)
         await _wait_for(
             lambda: services.sessions.get_project_session(
                 PROJECT_ID,
             ).status.value
-            == "IDLE",
+            == "CANCELLED",
         )
+        reclaimed = runs.get(PROJECT_ID, "agent-run-dead-owner")
         session = services.sessions.get_project_session(PROJECT_ID)
         await driver.stop()
-        return session
+        return reclaimed, session
 
-    session = asyncio.run(scenario())
+    reclaimed, session = asyncio.run(scenario())
 
-    assert session.status.value == "IDLE"
+    assert reclaimed.status.value == "FAILED"
+    assert (reclaimed.error or {}).get("code") == "INTERRUPTED"
+    assert session.status.value == "CANCELLED"
     assert session.active_run_id is None
+    assert session.last_consumed_message_seq == session.last_message_seq

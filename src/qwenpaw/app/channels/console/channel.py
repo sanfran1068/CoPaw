@@ -263,6 +263,9 @@ class ConsoleChannel(BaseChannel):
             content_parts=content_parts,
             channel_meta=meta,
         )
+        message_metadata = payload.get("message_metadata")
+        if isinstance(message_metadata, dict) and request.input:
+            request.input[0].metadata = message_metadata
         request.channel_meta = meta
         rc = meta.get("request_context")
         if isinstance(rc, dict) and rc:
@@ -496,7 +499,7 @@ class ConsoleChannel(BaseChannel):
 
             to_handle = request.user_id or ""
             if self._on_reply_sent:
-                self._on_reply_sent(
+                await self._on_reply_sent(
                     self.channel,
                     to_handle,
                     request.session_id or f"{self.channel}:{to_handle}",

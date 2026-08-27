@@ -34,6 +34,7 @@ class CreatorSessionView(StrictModel):
         ge=0,
     )
     last_event_seq: int = Field(alias="lastEventSeq", ge=0)
+    error: dict[str, Any] | None = None
 
 
 class CreatorSessionResponse(StrictModel):
@@ -73,6 +74,9 @@ class CreatorMessageView(StrictModel):
 class MessagePage(StrictModel):
     items: list[CreatorMessageView]
     next_after: int | None = Field(None, alias="nextAfter")
+    # Backward-pagination cursor: the smallest seq of this page when older
+    # history exists (``before``/``tail`` requests only).
+    next_before: int | None = Field(None, alias="nextBefore")
 
 
 class CreatorMessageRequest(StrictModel):

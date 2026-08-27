@@ -278,6 +278,36 @@ The engine also runs **`ShellEvasionGuardian`** on `execute_shell_command`. It t
 
 ---
 
+## Mailbox Security
+
+A mailbox authorization code grants full IMAP/SMTP send and receive access. The
+public mailbox identity and automatic-processing settings live in the
+workspace's `agent.json`; the authorization code, app password, or login
+password is encrypted in `credentials.yaml`. `drivers/mcp/qwenpawmail.yaml`
+stores only a credential reference, which is resolved when the MCP subprocess
+starts. Neither the Agent API nor the agent returns these secrets. Passwords,
+phone numbers, and verification codes entered on a provider's registration page
+are not saved to QwenPaw configuration either. Restrict workspace access, do not
+commit these files, and do not share backups containing both the workspace and
+decryption material. Revoke and rotate the credential with the provider if
+exposure is suspected.
+
+Treat every message body as untrusted external input. Automatic processing must
+not follow instructions embedded in email and is barred from permanent deletion
+by default. Outbound mail is limited to the original sender or a known contact in
+`CONTACTS.md`; money, commitments, and sensitive relationships require a draft
+and confirmation. When a message cannot be classified, the exploration path
+raises every subsequent tool call to strict approval.
+
+When automation is enabled, also consider **Mail Access Control**. Unknown
+senders remain pending until allowed, at which point every message saved in the
+pending record is processed; denied senders' later messages are marked read and
+skipped. Among the tools, `delete_message` is permanent, while `delete_thread`
+moves messages to Trash; verify the target before either action. See
+[Mailbox Management and Automation](./mailbox#Mail-Access-Control).
+
+---
+
 ## File Guard
 
 The **File Guard** blocks agent tools from accessing sensitive files and directories. It runs automatically on **every tool call**, scanning all file-path-related parameters to enforce a deny list of protected paths.
@@ -432,6 +462,36 @@ Sandbox configuration is compiled automatically by the governance policy engine.
 | `writable`   | bool   | `false` | Allow write access                    |
 | `executable` | bool   | `true`  | Allow executing binaries (macOS only) |
 
+#### Granting a path outside the workspace
+
+There is no `mounts` field to edit directly. The list is derived from your
+`policy.yaml` rules: a `Write(...)` rule becomes a writable mount and a
+`Read(...)` rule a read-only one, with the workspace always writable. So the
+way to let a sandboxed command write outside the workspace is to add the
+rule, not to hand-write a mount.
+
+This matters for tools that keep a cache in the home directory. `uv`, `pip`
+and `npm` all fail under the sandbox until their cache directory is granted:
+
+```yaml
+# policy.yaml — let uv populate its cache
+user_rules:
+  - match: Write(~/.cache/uv/**)
+    action: allow
+    reason: uv build cache
+```
+
+The path may use `~` or `$VAR`; both are expanded when the mount is
+compiled. Two behaviours to keep in mind:
+
+- **A path is bound only if it exists when the sandbox starts.** An absent
+  path is skipped and reported at `WARNING` as not bound. A cache directory
+  usually does not exist before its tool first runs, so create it once
+  (`mkdir -p ~/.cache/uv`) if the very first sandboxed run must write there.
+- **`mode=none` ignores mounts entirely**, so inside a container without a
+  kernel backend the grant is irrelevant — nothing is restricted to begin
+  with.
+
 ### Violation detection
 
 When a sandboxed command attempts to access a path outside its allowed view, the OS kernel blocks the operation. QwenPaw detects these violations by matching stderr patterns:
@@ -452,8 +512,15 @@ When a violation is detected:
 
 ### Current limitations
 
-- **Network isolation**: Not implemented in the current version. All sandboxed processes have full network access regardless of `network_allow` settings. Network namespace isolation (`--unshare-net` for bubblewrap) is planned.
-- **Resource limits**: `max_processes` and `max_memory_mb` fields exist in the config but are not enforced by any current backend.
+- **Network isolation**: Only the all-open and block-all postures are enforceable, and only on backends with a kernel-level mechanism — Seatbelt (macOS), Landlock ABI v4+ (Linux, kernel 6.7+), AppContainer capability SIDs and the elevated Windows backend's WFP rules. Domain-level filtering is implemented nowhere; what a domain allowlist degrades to differs by backend, so read the log line rather than assuming: Seatbelt / AppContainer open the network **fully**, while WFP blocks it **entirely**. Bubblewrap does not isolate the network at all (`--unshare-net` is planned).
+- **Windows without administrator rights**: the unelevated backend has neither WFP rules nor capability SIDs. A block-all request only sets HTTP(S) proxy environment variables, which a raw socket ignores, and a domain allowlist sets nothing at all — so `network_allow` is never enforced there and is always reported as ignored. Run as administrator for enforced blocking.
+- **`network_ports`**: honoured only by Landlock ABI v4+, and only together with `network_allow=[]`. Port rules attach to the same handled-access mask as the wholesale block, so with the network left open — including the `["*"]` default — no port rule is installed.
+- **Resource limits**: `max_processes` and `max_memory_mb` are accepted but not enforced by any backend; enforcing them needs Linux cgroups / Windows Job objects.
+- **`env_mode="allowlist"`**: Not implemented. Every backend behaves as `"inject"` — inherit the current environment, then apply `env_vars`. Because the allowlist exists to keep undeclared host variables (API keys, cloud credentials, tokens) out of the sandboxed child, requesting it is reported at `WARNING`.
+- **`shell_executable`**: Honoured by the Windows backends and `mode=none`. The bubblewrap / Seatbelt / Landlock backends pin their own shell. Under `mode=none` a configured shell that cannot be resolved is reported and falls back to the platform default (`COMSPEC` / cmd.exe on Windows, `SHELL` / `/bin/bash` elsewhere); the command flag follows the shell, so cmd.exe gets `/c`, PowerShell gets `-Command` and POSIX shells get `-c`.
+- **`platform_hints`**: only `seatbelt_extra_rules` (macOS) is consumed. Any other key — including a typo of that one — is dropped, and because the hints can carry admin-authored deny rules the whole field is then reported at `WARNING`.
+- **`mode=none` enforces nothing**: the passthrough backend applies only `timeout_seconds`, `env_vars` and `shell_executable`. Every isolation constraint is ignored. This is the common case inside containers, where no kernel backend is available and QwenPaw falls back to `mode=none`.
+- **Unenforced constraints are logged, never silently dropped**: each backend declares the fields it actually applies, and anything else you configured is reported when the sandbox is created — constraints that form a security boundary at `WARNING`, the rest at `DEBUG`. Seeing `NoneSandbox does not enforce deny_paths=~/.ssh; the constraint is IGNORED.` means those paths really are readable. Treat these lines as security findings, not noise.
 - **Windows AppContainer** (`allow_read_all=False`): Requires administrator privileges for initial ACL setup. The AppContainer profile is preserved for reuse across invocations with the same configuration.
 - **Windows AppContainer file deletion limitation** (`allow_read_all=False`): Sandboxed processes in AppContainer mode may be unable to delete files within the workspace. This does not affect `allow_read_all=True` (Restricted_token) mode. A solution is under investigation.
 - **Windows Restricted_token** (`allow_read_all=True`): Full isolation (dedicated local user, WFP firewall rules) requires administrator privileges. When running without administrator privileges, an unelevated sandbox mode is used instead — it provides write restrictions via `CreateRestrictedToken` but with limited isolation compared to the full sandbox. For maximum security, running as administrator is recommended.

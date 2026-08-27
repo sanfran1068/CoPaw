@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import FileProjectReviewPanel from "@/components/agent/FileProjectReviewPanel";
-import type { FileProjectReviewRecord } from "@/contracts/creator";
 import { useFileProjectReviewStore } from "@/store/fileProjectReviewStore";
+import { makeReviewOperation, makeReviewRecord } from "@/test/agentFixtures";
 
 const navigateToLocator = vi.fn();
 
@@ -19,53 +19,26 @@ vi.mock("@/api/creator", async (importOriginal) => {
   };
 });
 
-function review(operationCount = 1): FileProjectReviewRecord {
-  return {
-    review_id: "review-1",
-    round_id: "round-1",
-    request_id: "request-1",
-    request_message_seq: 4,
-    interrupted_run_id: "run-1",
-    baseline_generation: 2,
-    baseline_etag: "base-2",
-    candidate_generation: 3,
-    candidate_etag: "candidate-3",
-    decision_token: "token-1",
-    status: "PENDING",
-    operations: Array.from({ length: operationCount }, (_, index) => ({
-      kind: "update",
-      json_pointer: index === 0 ? "/description" : `/story/scenes/${index}`,
-      file_id: null,
-      target_ref: null,
-      before_hash: `before-${index}`,
-      after_hash: `after-${index}`,
-      before: index === 0 ? "Old title" : { index, enabled: false },
-      after: index === 0 ? "New title" : { index, enabled: true },
-      operation_id: `operation-${index + 1}`,
-      ui_locator: {
-        page: "plan",
-        mediaType: "text",
-        field: index === 0 ? "/description" : `/story/scenes/${index}`,
-      },
-      decision: "PENDING",
-    })),
-    created_at: "2026-07-15T00:00:00Z",
-    updated_at: "2026-07-15T00:00:01Z",
-  };
-}
+const review = (operationCount = 1) =>
+  makeReviewRecord({
+    operations: Array.from({ length: operationCount }, (_, index) => {
+      const pointer = index === 0 ? "/description" : `/story/scenes/${index}`;
+      return makeReviewOperation({
+        json_pointer: pointer,
+        before: index === 0 ? "Old title" : { index, enabled: false },
+        after: index === 0 ? "New title" : { index, enabled: true },
+        operation_id: `operation-${index + 1}`,
+        ui_locator: { page: "plan", mediaType: "text", field: pointer },
+      });
+    }),
+  });
 
-function mediaReview(): FileProjectReviewRecord {
-  return {
-    ...review(),
+const mediaReview = () =>
+  makeReviewRecord({
     operations: [
-      {
-        kind: "update",
+      makeReviewOperation({
         json_pointer:
           "/assets/artifact_slots_by_id/element:el-1:main/selected_version_id",
-        file_id: null,
-        target_ref: null,
-        before_hash: "before-media",
-        after_hash: "after-media",
         before: "ver-old",
         after: "ver-new",
         operation_id: "operation-media",
@@ -76,16 +49,12 @@ function mediaReview(): FileProjectReviewRecord {
           artifactKind: "r2v_video",
           artifactVersionId: "ver-new",
         },
-        decision: "PENDING",
-      },
+      }),
     ],
-  };
-}
+  });
 
-function seed(
-  value: FileProjectReviewRecord,
-  decide = vi.fn(async () => value),
-) {
+/** Seeds the review store and renders the panel; returns the decide spy. */
+function setup(value = review(), decide = vi.fn(async () => value)) {
   useFileProjectReviewStore.setState({
     projectId: "p1",
     reviews: [value],
@@ -95,6 +64,7 @@ function seed(
     decisionInFlight: false,
     decide,
   });
+  render(<FileProjectReviewPanel projectId="p1" review={value} />);
   return decide;
 }
 
@@ -104,55 +74,13 @@ afterEach(() => {
 });
 
 describe("FileProjectReviewPanel", () => {
-  it("renders the review panel with the provided review", () => {
-    seed(review());
-    const reviewData = review();
-    render(<FileProjectReviewPanel projectId="p1" review={reviewData} />);
+  it("renders a text summary and navigates to the ui_locator on inspect", () => {
+    setup();
     expect(screen.getByText("文件项目修改")).toBeInTheDocument();
-    // Text changes no longer render a diff inside the review panel; only a
-    // readable summary is shown, and the full diff appears at the original
-    // location via the "查看" (view) jump.
-    expect(screen.getByText("描述")).toBeInTheDocument();
+    // Text changes render only a summary; the full diff shows via "查看".
     expect(screen.getByTitle("/description")).toBeInTheDocument();
     expect(document.querySelector("[data-review-diff]")).toBeNull();
-    expect(screen.queryByText("Old title")).toBeNull();
     expect(screen.queryByText("New title")).toBeNull();
-  });
-
-  it("submits an individual Keep decision by operation_id", async () => {
-    const decide = seed(review());
-    const reviewData = review();
-    render(<FileProjectReviewPanel projectId="p1" review={reviewData} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "保留 /description" }));
-    await waitFor(() =>
-      expect(decide).toHaveBeenCalledWith("p1", "review-1", [
-        {
-          operation_id: "operation-1",
-          decision: "ACCEPT",
-        },
-      ]),
-    );
-  });
-
-  it("submits all pending operations in one Undo all request", async () => {
-    const value = review(2);
-    const decide = seed(value);
-    render(<FileProjectReviewPanel projectId="p1" review={value} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "全部撤销" }));
-    await waitFor(() =>
-      expect(decide).toHaveBeenCalledWith("p1", "review-1", [
-        { operation_id: "operation-1", decision: "REJECT" },
-        { operation_id: "operation-2", decision: "REJECT" },
-      ]),
-    );
-  });
-
-  it("navigates to the ui_locator when a text operation is inspected", () => {
-    seed(review());
-    const reviewData = review();
-    render(<FileProjectReviewPanel projectId="p1" review={reviewData} />);
     fireEvent.click(screen.getByRole("button", { name: "查看 /description" }));
     expect(navigateToLocator).toHaveBeenCalledWith(
       "p1",
@@ -161,10 +89,67 @@ describe("FileProjectReviewPanel", () => {
     );
   });
 
+  it("submits an individual Keep decision by operation_id", async () => {
+    const decide = setup();
+
+    fireEvent.click(screen.getByRole("button", { name: "保留 /description" }));
+    await waitFor(() =>
+      expect(decide).toHaveBeenCalledWith("p1", "review-1", [
+        { operation_id: "operation-1", decision: "ACCEPT" },
+      ]),
+    );
+  });
+
+  it("opens feedback before undoing all pending operations", async () => {
+    const decide = setup(review(2));
+
+    fireEvent.click(screen.getByRole("button", { name: "全部撤销" }));
+    expect(decide).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toHaveTextContent("撤销 2 项内容");
+    fireEvent.click(screen.getByRole("button", { name: "仅撤销" }));
+    await waitFor(() =>
+      expect(decide).toHaveBeenCalledWith(
+        "p1",
+        "review-1",
+        [
+          { operation_id: "operation-1", decision: "REJECT" },
+          { operation_id: "operation-2", decision: "REJECT" },
+        ],
+        { action: "UNDO_ONLY" },
+      ),
+    );
+  });
+
+  it("submits structured feedback when undo and regenerate is selected", async () => {
+    const decide = setup();
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销 /description" }));
+    const feedback = screen.getByRole("textbox", { name: "反馈与调整要求" });
+    expect(screen.getAllByRole("textbox")).toHaveLength(1);
+    expect(screen.queryByRole("textbox", { name: "哪里不对" })).toBeNull();
+    fireEvent.change(feedback, {
+      target: { value: "人物状态不对；保持身份一致，改成落魄时期" },
+    });
+    const regenerate = screen.getByRole("button", { name: "撤销并重做" });
+    fireEvent.click(regenerate);
+    fireEvent.click(regenerate);
+
+    await waitFor(() =>
+      expect(decide).toHaveBeenCalledWith(
+        "p1",
+        "review-1",
+        [{ operation_id: "operation-1", decision: "REJECT" }],
+        {
+          action: "UNDO_AND_REGENERATE",
+          feedbackNote: "人物状态不对；保持身份一致，改成落魄时期",
+        },
+      ),
+    );
+    expect(decide).toHaveBeenCalledTimes(1);
+  });
+
   it("renders a media preview and opens the generation detail locator", () => {
-    seed(mediaReview());
-    const reviewData = mediaReview();
-    render(<FileProjectReviewPanel projectId="p1" review={reviewData} />);
+    setup(mediaReview());
     expect(screen.getByText("视频审阅")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "查看生成详情" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "查看生成详情" }));

@@ -125,8 +125,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
   };
 }
 
-function renderConfigHook() {
-  return renderHook(() => useAgentConfig());
+function renderConfigHook(onConfigLoaded?: (config: Config) => void) {
+  return renderHook(() => useAgentConfig(onConfigLoaded));
 }
 
 describe("useAgentConfig", () => {
@@ -252,6 +252,25 @@ describe("useAgentConfig", () => {
     expect(messageMock.success).toHaveBeenCalledWith("agentConfig.saveSuccess");
   });
 
+  it("reports the server config after save", async () => {
+    const onConfigLoaded = vi.fn();
+    const savedConfig = makeConfig({
+      reme_light_memory_config: {
+        needs_reindex: true,
+      } as Config["reme_light_memory_config"],
+    });
+    apiMocks.updateAgentRunningConfig.mockResolvedValue(savedConfig);
+    const { result } = renderConfigHook(onConfigLoaded);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    onConfigLoaded.mockClear();
+
+    await act(async () => {
+      await result.current.handleSave();
+    });
+
+    expect(onConfigLoaded).toHaveBeenCalledWith(savedConfig);
+  });
+
   it("handleSave persists configToSave containing approval_level", async () => {
     apiMocks.updateAgentRunningConfig.mockResolvedValue(makeConfig());
     const { result } = renderConfigHook();
@@ -269,6 +288,37 @@ describe("useAgentConfig", () => {
 
     const saved = apiMocks.updateAgentRunningConfig.mock.calls[0][0] as Config;
     expect(saved.approval_level).toBe("STRICT");
+  });
+
+  it("handleSave syncs legacy max_iters from loop.iteration.max_iterations", async () => {
+    apiMocks.getAgentRunningConfig.mockResolvedValue(
+      makeConfig({ max_iters: 100 }),
+    );
+    const loaded = makeConfig({ max_iters: 100 });
+    const { max_iters: _staleMaxIters, ...formWithoutMaxIters } = loaded;
+    mockGetFieldsValue.mockReturnValue({
+      ...formWithoutMaxIters,
+      loop: {
+        ...loaded.loop,
+        iteration: {
+          enabled: true,
+          max_iterations: 99,
+        },
+      },
+    });
+    apiMocks.updateAgentRunningConfig.mockResolvedValue(makeConfig());
+    const { result } = renderConfigHook();
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    await act(async () => {
+      await result.current.handleSave();
+    });
+
+    const saved = apiMocks.updateAgentRunningConfig.mock.calls[0][0] as Config;
+    expect(saved.loop.iteration?.max_iterations).toBe(99);
+    expect(saved.max_iters).toBe(99);
   });
 
   it("handleSave includes unmounted custom loop template values", async () => {
@@ -385,5 +435,95 @@ describe("useAgentConfig", () => {
     expect(modalConfirmMock).toHaveBeenCalledTimes(1);
     const options = modalConfirmMock.mock.calls[0][0] as { title: string };
     expect(options.title).toBe("agentConfig.languageConfirmTitle");
+  });
+
+  // -------------------------------------------------------------------------
+  // #5137 — config lost when Collapse is not rendered
+  // When a Collapse panel is collapsed (unrendered), form.getFieldsValue()
+  // only returns currently registered fields. The deep-merge logic in
+  // handleSave must preserve the original nested values from collapsed panels
+  // so they are not lost on save.
+  // -------------------------------------------------------------------------
+  it("handleSave preserves collapsed (unrendered) nested config via deep merge (#5137)", async () => {
+    const originalConfig = makeConfig({
+      reme_light_memory_config: {
+        needs_reindex: false,
+        embedding_model: "text-embedding-v3",
+        search_top_k: 5,
+      } as unknown as Config["reme_light_memory_config"],
+      light_context_config: {
+        strategy: "scroll",
+        context_compact_config: {
+          enabled: true,
+          compact_threshold_ratio: 0.8,
+          reserve_threshold_ratio: 0.1,
+        },
+        scroll_config: {
+          history_retention_days: 14,
+        },
+      } as unknown as Config["light_context_config"],
+      adbpg_memory_config: {
+        auto_search_enabled: true,
+        auto_save_enabled: true,
+        search_top_k: 10,
+      } as unknown as Config["adbpg_memory_config"],
+    });
+
+    apiMocks.getAgentRunningConfig.mockResolvedValue(originalConfig);
+    apiMocks.updateAgentRunningConfig.mockResolvedValue(originalConfig);
+
+    // Simulate: only light_context_config.strategy is rendered (other panels collapsed).
+    // getFieldsValue(true) returns partial nested objects.
+    mockGetFieldsValue.mockReturnValue({
+      light_context_config: {
+        strategy: "native",
+        // context_compact_config and scroll_config are MISSING because their
+        // Collapse panels are collapsed (unrendered).
+      },
+      reme_light_memory_config: {
+        // Only needs_reindex is rendered; embedding_model and search_top_k are
+        // inside a collapsed sub-panel.
+        needs_reindex: true,
+      },
+      // adbpg_memory_config is entirely inside a collapsed panel — not in form values at all.
+    });
+
+    const { result } = renderConfigHook();
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    await act(async () => {
+      await result.current.handleSave();
+    });
+
+    const saved = apiMocks.updateAgentRunningConfig.mock.calls[0][0] as Config;
+
+    // The rendered field should be updated
+    expect((saved.light_context_config as any).strategy).toBe("native");
+
+    // The collapsed (unrendered) nested fields must be preserved from original
+    expect(
+      (saved.light_context_config as any).context_compact_config.enabled,
+    ).toBe(true);
+    expect(
+      (saved.light_context_config as any).context_compact_config
+        .compact_threshold_ratio,
+    ).toBe(0.8);
+    expect(
+      (saved.light_context_config as any).scroll_config.history_retention_days,
+    ).toBe(14);
+
+    // reme_light_memory_config: rendered field updated, collapsed fields preserved
+    expect((saved.reme_light_memory_config as any).needs_reindex).toBe(true);
+    expect((saved.reme_light_memory_config as any).embedding_model).toBe(
+      "text-embedding-v3",
+    );
+    expect((saved.reme_light_memory_config as any).search_top_k).toBe(5);
+
+    // adbpg_memory_config: entirely collapsed — original values fully preserved
+    expect((saved.adbpg_memory_config as any).auto_search_enabled).toBe(true);
+    expect((saved.adbpg_memory_config as any).auto_save_enabled).toBe(true);
+    expect((saved.adbpg_memory_config as any).search_top_k).toBe(10);
   });
 });

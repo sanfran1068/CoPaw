@@ -19,6 +19,9 @@ from typing import Any, Final
 from uuid import uuid4
 
 from pydantic import ValidationError
+from services.runtime_files.atomic_store import (
+    fsync_directory as runtime_fsync_directory,
+)
 from services.runtime_files.locking import CrossProcessFileLock
 from services.storage_root import require_creator_data_root
 from utils.logger import setup_logger
@@ -26,7 +29,7 @@ from utils.logger import setup_logger
 from .models import Project
 from .serialization import (
     CanonicalJsonError,
-    load_project_json,
+    load_project_json_with_etag,
     project_etag,
     project_file_bytes,
 )
@@ -36,6 +39,11 @@ logger = setup_logger("store")
 
 DEFAULT_MAX_PROJECT_JSON_BYTES = 8 * 1024 * 1024
 _SAFE_PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# Projects materialized from plugin-bundled inspiration examples carry this
+# marker file so listing keeps them out of the user's own project shelf while
+# every id-addressed route still serves them normally.
+BUILTIN_EXAMPLE_MARKER: Final = ".builtin-example"
 
 
 class ProjectStoreError(RuntimeError):
@@ -60,6 +68,15 @@ class ProjectIntegrityError(ProjectStoreError):
 
 class UnsafeProjectPath(ProjectStoreError):
     pass
+
+
+class InvalidProjectId(UnsafeProjectPath):
+    """The caller supplied a malformed id, as opposed to a damaged store.
+
+    Kept under UnsafeProjectPath so existing handlers that skip unusable
+    directory names keep working, while routes can single it out as a client
+    input mistake rather than a storage fault.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +255,11 @@ class ProjectStore:
         project_root = self.project_root(candidate.project_id)
         payload = self._checked_payload(candidate)
         staging_root = self.root / ".staging"
-        staged_project = staging_root / f"{candidate.project_id}.{uuid4().hex}"
+        # Keep the private staged directory name short: Runtime bootstrap
+        # writes deeply nested temp files inside it, and a long name here
+        # pushes those paths past the Windows MAX_PATH (260) limit.  The
+        # name is never parsed; publication renames it to the project id.
+        staged_project = staging_root / f"p{uuid4().hex}"
 
         # Keep one global lock order across lifecycle operations and commit
         # publication: lifecycle lock first, then the in-process store lock.
@@ -286,6 +307,7 @@ class ProjectStore:
                 # Project even if a later directory fsync reports failure.
                 shutil.rmtree(staged_project, ignore_errors=True)
                 raise
+        logger.info("project created: %s", candidate.project_id)
         return _snapshot(candidate)
 
     def read(self, project_id: str) -> ProjectSnapshot:
@@ -316,7 +338,7 @@ class ProjectStore:
                 f"project.json exceeds {self.max_project_json_bytes} bytes",
             )
         try:
-            project = load_project_json(payload)
+            project, source_etag = load_project_json_with_etag(payload)
         except CanonicalJsonError as exc:
             raise ProjectIntegrityError(
                 f"Invalid project.json for {safe_id}",
@@ -326,7 +348,11 @@ class ProjectStore:
                 f"Project identity mismatch: directory={safe_id}, file={project.project_id}",
             )
         self._validate_asset_paths(project_root, project)
-        return _snapshot(project)
+        return ProjectSnapshot(
+            project=project,
+            etag=source_etag,
+            generation=project.generation,
+        )
 
     def replace(
         self,
@@ -406,6 +432,9 @@ class ProjectStore:
             except UnsafeProjectPath:
                 continue
             if not (entry / "project.json").exists():
+                continue
+            # Bundled example Projects never surface in "my projects".
+            if (entry / BUILTIN_EXAMPLE_MARKER).exists():
                 continue
             try:
                 snapshot = self.read(safe_id)
@@ -487,6 +516,7 @@ class ProjectStore:
         """Atomically remove a Project from discovery, then delete its tree."""
 
         safe_id = _safe_project_id(project_id)
+        tombstone: Path | None = None
         with self.lifecycle_lock(safe_id), self._lock:
             current = self.read(safe_id)
             if expected_etag is not None and current.etag != expected_etag:
@@ -502,15 +532,28 @@ class ProjectStore:
                 raise ProjectStoreError(
                     f"Cannot delete Project: {safe_id}",
                 ) from exc
+        # The atomic rename above is the deletion boundary. Physical cleanup
+        # is deliberately detached: a large tree or an open provider file must
+        # not keep DELETE/Stop waiting after the Project is already absent.
+        # Startup recovery also removes any tombstone left by a crash.
+        assert tombstone is not None
+
+        def cleanup_deleted_tree() -> None:
             try:
                 shutil.rmtree(tombstone)
-            except OSError as exc:
-                # The Project is already logically absent. Leave the hidden
-                # tombstone for startup cleanup instead of moving it back and
-                # accidentally resurrecting stale data.
-                raise ProjectStoreError(
-                    f"Project was removed but tombstone cleanup failed: {safe_id}",
-                ) from exc
+            except OSError:
+                logger.warning(
+                    "Project tombstone cleanup deferred to startup: %s",
+                    tombstone,
+                    exc_info=True,
+                )
+
+        threading.Thread(
+            target=cleanup_deleted_tree,
+            name=f"creator-delete-cleanup:{safe_id}",
+            daemon=True,
+        ).start()
+        logger.info("project deleted: %s", safe_id)
 
     def export(self, project_id: str) -> tuple[int, Iterator[bytes]]:
         """Compress the whole Project folder into a zip under ``CREATOR_DATA_ROOT``/exports/.
@@ -529,25 +572,28 @@ class ProjectStore:
         logger.info(f"exporting to:{str(export_root / zip_file_stem)}")
 
         archive_path = None
-        with self.lifecycle_lock(safe_id), self._lock:
-            # Confirm the Project exists and is loadable before archiving.
-            self.read(safe_id)
-            try:
-                archive_path = shutil.make_archive(
-                    str(export_root / zip_file_stem),
-                    "zip",
-                    root_dir=str(self.root),
-                    base_dir=safe_id,
-                )
-                logger.info(f"export file path:{archive_path}")
-            except Exception as e:
-                logger.error(
-                    f"failed to create export file for project {safe_id}",
-                    exc_info=True,
-                )
-                raise ProjectStoreError(
-                    f"failed to create export file for project {safe_id}",
-                ) from e
+        # Confirm it exists before starting. The archive itself intentionally
+        # runs without either the lifecycle or in-process store lock: Project
+        # files are atomically replaced, and export is explicitly a best-effort
+        # snapshot. Holding the global mutation boundary across ZIP I/O caused
+        # common 10-second lock timeouts on large Projects.
+        self.read(safe_id)
+        try:
+            archive_path = shutil.make_archive(
+                str(export_root / zip_file_stem),
+                "zip",
+                root_dir=str(self.root),
+                base_dir=safe_id,
+            )
+            logger.info(f"export file path:{archive_path}")
+        except Exception as e:
+            logger.error(
+                f"failed to create export file for project {safe_id}",
+                exc_info=True,
+            )
+            raise ProjectStoreError(
+                f"failed to create export file for project {safe_id}",
+            ) from e
 
         return (
             Path(archive_path).stat().st_size,
@@ -572,14 +618,26 @@ class ProjectStore:
             Path(archive_path).unlink(missing_ok=True)
             logger.info(f"deleted project export zip file {archive_path}")
 
-    def lifecycle_lock(self, project_id: str) -> CrossProcessFileLock:
-        """Serialize creation/deletion with all Project-scoped mutations."""
+    def lifecycle_lock(
+        self,
+        project_id: str,
+        *,
+        shared: bool = False,
+    ) -> CrossProcessFileLock:
+        """Guard a Project lifetime without serializing unrelated Runtime domains.
+
+        Project creation, deletion and Project-state publication use the
+        default exclusive side. Runtime-only transitions use ``shared=True``:
+        they may proceed in parallel with one another, but still cannot race a
+        delete or Project commit that owns the exclusive side.
+        """
 
         return CrossProcessFileLock(
             self.root
             / ".locks"
             / f"project-{_safe_project_id(project_id)}.lock",
             timeout_seconds=10.0,
+            shared=shared,
         )
 
     def _checked_payload(self, project: Project) -> bytes:
@@ -674,7 +732,7 @@ def _safe_project_id(value: str) -> str:
         or not _SAFE_PROJECT_ID.fullmatch(value)
         or "\x00" in value
     ):
-        raise UnsafeProjectPath(f"Unsafe project id: {value!r}")
+        raise InvalidProjectId(f"Unsafe project id: {value!r}")
     return value
 
 
@@ -696,18 +754,12 @@ def _snapshot(project: Project) -> ProjectSnapshot:
 
 
 def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    descriptor = os.open(directory, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    runtime_fsync_directory(directory)
 
 
 __all__ = [
     "DEFAULT_MAX_PROJECT_JSON_BYTES",
+    "InvalidProjectId",
     "ProjectAlreadyExists",
     "ProjectConflict",
     "ProjectIntegrityError",
