@@ -58,4 +58,24 @@ describe("CoPaw SDK input queue adapter", () => {
       }),
     ).resolves.toBe(true);
   });
+
+  it("allows the first message to create a session before queueing is possible", async () => {
+    const getSessionRunning = vi.fn();
+    const queue = createSdkInputQueueOptions({
+      agentId: "agent-a",
+      getIdentity: () => ({}),
+      getBackendSessionId: () => null,
+      getSessionRunning,
+      onFull: vi.fn(),
+      onSessionNotReady: vi.fn(),
+    });
+
+    await expect(
+      queue.isSessionRunning?.({
+        sessionId: undefined,
+        queueSessionId: undefined,
+      }),
+    ).resolves.toBe(false);
+    expect(getSessionRunning).not.toHaveBeenCalled();
+  });
 });

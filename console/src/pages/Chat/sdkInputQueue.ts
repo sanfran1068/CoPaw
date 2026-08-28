@@ -67,7 +67,12 @@ export function createSdkInputQueueOptions(
     getRequestContext: requestContext,
     isSessionRunning: async ({ sessionId, requestContext: snapshot }) => {
       const backendSessionId = snapshot?.session_id || sessionId;
-      if (!backendSessionId) return true;
+      // A blank new-chat screen has no session until its first message is
+      // submitted. Treat that known pre-session state as idle so the SDK can
+      // send directly and let the host create the conversation. Returning
+      // true here makes the SDK try to enqueue the first message, but a queue
+      // cannot exist before there is a session key.
+      if (!backendSessionId) return false;
       try {
         return await options.getSessionRunning(
           backendSessionId,
