@@ -4,16 +4,15 @@ QwenPaw Chat sidebar & multi-tab end-to-end tests (Sprint 4).
 
 Cases:
 - SIDEBAR-001  P1  test_sidebar_date_groups_and_collapse   (upstream #5643)
-- MULTITAB-001 P2  test_non_owner_tab_shows_queue_banner   (upstream #5664)
+- MULTITAB-001 P0  test_sdk_queue_has_single_cross_tab_owner
 
 SIDEBAR-001 mocks ``GET /api/chats?archived=false`` via page.route because
 the backend cannot backfill timestamps (patch forces "now"), so date
 buckets are otherwise impossible to construct. All assertions stay UI-side.
 
-MULTITAB-001 uses two real pages in the SAME browser context (Web Locks
-are shared per origin per context): the first page grabs the
-``qwenpaw:queue-owner:<sessionId>`` lock, the second becomes queue-only
-and must render the info banner in the sender area.
+MULTITAB-001 uses two real pages in the SAME browser context. A forced
+``running`` status keeps one input queued so the SDK's Web Locks and
+BroadcastChannel behavior can be asserted without sending to a real model.
 """
 from __future__ import annotations
 
@@ -106,17 +105,17 @@ class TestSidebarDateGroups:
 
 
 # ============================================================================
-# MULTITAB-001 P2 — non-owner tab queue banner (upstream #5664)
+# MULTITAB-001 P0 — SDK queue single-owner arbitration
 # ============================================================================
 
 @pytest.mark.integration
-@pytest.mark.p2
+@pytest.mark.p0
 @pytest.mark.chat_sidebar
 class TestMultiTabQueueBanner:
-    """Second tab on the same session becomes queue-only and shows a banner."""
+    """SDK queue state is shared and exactly one tab owns execution."""
 
     @pytest.mark.test_id("MULTITAB-001")
-    def test_non_owner_tab_shows_queue_banner(
+    def test_sdk_queue_has_single_cross_tab_owner(
         self,
         page,
         api_context,
@@ -141,42 +140,72 @@ class TestMultiTabQueueBanner:
             pytest.skip("chat seed returned no id; cannot test banner")
 
         session_url = f"{config.base_url}/chat/{chat_id}"
+        browser_context = page.context
         page2 = None
+
+        def force_running(route):
+            response = route.fetch()
+            payload = response.json()
+            payload["status"] = "running"
+            route.fulfill(response=response, json=payload)
+
+        browser_context.route(f"**/api/chats/{chat_id}", force_running)
         try:
-            log_test_step("2. Tab 1 opens the session and becomes lock owner")
+            log_test_step("2. Both tabs open the same SDK queue scope")
             chat1 = ChatPage(page)
             page.goto(session_url, wait_until="commit", timeout=chat1.timeout)
             expect(page.locator(chat1.CHAT_INPUT).first).to_be_visible(
                 timeout=chat1.timeout
             )
-            # Give tab 1 time to win the ownership Web Lock (300ms resolve
-            # timer + lock acquisition).
-            page.wait_for_timeout(1500)
-
-            log_test_step("3. Tab 2 (same context) opens the same session URL")
-            page2 = page.context.new_page()
+            page2 = browser_context.new_page()
             chat2 = ChatPage(page2)
             page2.goto(session_url, wait_until="commit", timeout=chat2.timeout)
             expect(page2.locator(chat2.CHAT_INPUT).first).to_be_visible(
                 timeout=chat2.timeout
             )
 
-            log_test_step("4. Tab 2 shows the queue-only info banner")
-            expect(chat2.get_queue_banner()).to_be_visible(timeout=15000)
+            log_test_step("3. Submit while backend reports running; SDK queues it")
+            queued_text = "sdk queue cross-tab ownership"
+            input2 = page2.locator(chat2.CHAT_INPUT).first
+            input2.fill(queued_text)
+            input2.press("Enter")
 
-            log_test_step("5. Tab 1 (owner) shows no banner")
-            expect(chat1.get_queue_banner()).not_to_be_visible(timeout=3000)
+            log_test_step("4. Queue item is synchronized to both tabs")
+            expect(chat1.get_queue_panel()).to_be_visible(timeout=15000)
+            expect(chat2.get_queue_panel()).to_be_visible(timeout=15000)
+            expect(
+                chat1.get_queue_items().filter(has_text=queued_text)
+            ).to_have_count(1)
+            expect(
+                chat2.get_queue_items().filter(has_text=queued_text)
+            ).to_have_count(1)
 
-            log_test_step("6. Closing tab 2 releases nothing it owned; owner keeps clean")
-            page2.close()
-            page2 = None
-            expect(chat1.get_queue_banner()).not_to_be_visible(timeout=3000)
+            log_test_step("5. Exactly one tab is marked as the remote/non-owner view")
+            page.wait_for_timeout(1200)
+            remote1 = chat1.get_queue_remote_owner().count() > 0
+            remote2 = chat2.get_queue_remote_owner().count() > 0
+            assert remote1 != remote2, (
+                f"expected one remote owner marker, got tab1={remote1}, tab2={remote2}"
+            )
+
+            log_test_step("6. Closing owner transfers queue execution ownership")
+            if remote1:
+                page2.close()
+                page2 = None
+                expect(chat1.get_queue_remote_owner()).not_to_be_visible(timeout=15000)
+            else:
+                page.close()
+                expect(chat2.get_queue_remote_owner()).not_to_be_visible(timeout=15000)
         finally:
             if page2 is not None:
                 try:
                     page2.close()
                 except Exception:
                     pass
+            try:
+                browser_context.unroute(f"**/api/chats/{chat_id}", force_running)
+            except Exception:
+                pass
             try:
                 api_context.delete(f"/api/chats/{chat_id}")
             except Exception:

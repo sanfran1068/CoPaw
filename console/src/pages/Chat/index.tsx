@@ -1,6 +1,7 @@
 import {
   AgentScopeRuntimeWebUI,
   IAgentScopeRuntimeWebUIOptions,
+  type IAgentScopeRuntimeWebUIInputData,
   type IAgentScopeRuntimeWebUIRef,
 } from "@agentscope-ai/chat";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -90,6 +91,16 @@ import {
 } from "../../plugins/registry/types";
 import { ChatScalar, ChatList } from "../../plugins/registry/slotKeys";
 import { HostRequestCard, HostResponseCard } from "./HostBubbles";
+import { cancelSdkChatRequest } from "./sdkCancellation";
+import {
+  buildChatSubmissionContext,
+  resolveChatRequestSnapshot,
+} from "./sdkRequestSnapshot";
+import {
+  clearSdkInputQueue,
+  createSdkInputQueueOptions,
+  migrateSdkInputQueue,
+} from "./sdkInputQueue";
 import { DownloadableAudios } from "../../components/Chat/MediaDownload";
 import { withGenericFallback } from "../../components/Chat/ToolCards/adapters/v1Adapter";
 import { applyApprovalLevelToRequestBody } from "./approvalPayload";
@@ -195,6 +206,7 @@ import {
 } from "../../utils/sessionRoute";
 import { useUploadLimitStore } from "../../stores/uploadLimitStore";
 import ChatSenderTabsPanel from "./components/ChatSenderTabsPanel";
+import BackgroundTaskPanel from "./components/BackgroundTaskPanel";
 import {
   selectTasksForSession,
   useBackgroundTasksStore,
@@ -650,6 +662,7 @@ function renderSuggestionLabel(command: string, description?: string) {
 const DEFAULT_USER_ID = "default";
 const DEFAULT_CHANNEL = "console";
 const WIDE_MODE_STORAGE_KEY = "qwenpaw_chat_wide_mode";
+const USE_SDK_INPUT_QUEUE = true;
 
 // Stable fallback so an absent queue entry doesn't produce a fresh array
 // reference on every render (which would invalidate the options memo).
@@ -1359,6 +1372,11 @@ export default function ChatPage() {
   const isOwnerRef = useRef(false);
   isOwnerRef.current = isOwner;
   useEffect(() => {
+    if (USE_SDK_INPUT_QUEUE) {
+      setIsOwner(true);
+      setOwnershipResolved(true);
+      return;
+    }
     setIsOwner(false);
     setOwnershipResolved(false);
     const ctrl = new AbortController();
@@ -1411,8 +1429,8 @@ export default function ChatPage() {
   // Whether this tab is confirmed to be a non-owner (queue-only) tab.
   // Stays false until ownership check completes, preventing a flash of
   // the "other tab is owner" banner on every session switch.
-  const isQueueOnlyTab = ownershipResolved && !isOwner;
-  const hasQueueItems = messageQueue.length > 0;
+  const isQueueOnlyTab = !USE_SDK_INPUT_QUEUE && ownershipResolved && !isOwner;
+  const hasQueueItems = !USE_SDK_INPUT_QUEUE && messageQueue.length > 0;
 
   // Backend session id for the background-task panel (list API + store filter).
   const [bgBackendSessionId, setBgBackendSessionId] = useState("");
@@ -1466,6 +1484,7 @@ export default function ChatPage() {
   }, [queueSessionId]);
 
   const scheduleNextSend = useCallback(() => {
+    if (USE_SDK_INPUT_QUEUE) return;
     if (autoSendTimerRef.current) clearTimeout(autoSendTimerRef.current);
     autoSendTimerRef.current = setTimeout(() => {
       autoSendTimerRef.current = null;
@@ -1508,6 +1527,7 @@ export default function ChatPage() {
   // Reload queue when switching sessions or on first mount
   const prevQueueSessionIdRef = useRef<string | null>(null);
   useEffect(() => {
+    if (USE_SDK_INPUT_QUEUE) return;
     const isFirstMount = prevQueueSessionIdRef.current === null;
     const isSameSession = prevQueueSessionIdRef.current === queueSessionId;
 
@@ -1897,6 +1917,7 @@ export default function ChatPage() {
   // takes over); start background senders for all OTHER sessions with pending
   // items. On unmount (or session switch), start bg sender for THIS session.
   useEffect(() => {
+    if (USE_SDK_INPUT_QUEUE) return;
     const currentQueueSessionId = queueSessionId;
     stopBackgroundQueue(currentQueueSessionId);
     // Kick off background senders for other sessions that have pending items
@@ -1936,6 +1957,7 @@ export default function ChatPage() {
   // 2. Queue goes from empty→non-empty while idle (Ctrl+Enter while not chatting)
   // Uses a delayed timer so session switches can cancel it before it fires.
   useEffect(() => {
+    if (USE_SDK_INPUT_QUEUE) return;
     const wasLoading = prevChatLoadingRef.current;
     const prevLen = prevQueueLenRef.current;
     prevChatLoadingRef.current = chatLoading;
@@ -1958,6 +1980,7 @@ export default function ChatPage() {
   // When this tab acquires ownership (e.g., previous owner closed), kick the
   // queue: any pending items left behind should now be sent by us.
   useEffect(() => {
+    if (USE_SDK_INPUT_QUEUE) return;
     if (!isOwner) return;
     if (chatLoadingRef.current) return;
     const q = useMessageQueueStore.getState().getQueue(queueSessionId);
@@ -1974,6 +1997,7 @@ export default function ChatPage() {
   //    enqueue, so we don't slip into a direct SDK send during the brief
   //    idle window between two queued items.
   useEffect(() => {
+    if (USE_SDK_INPUT_QUEUE) return;
     const handleEnterEnqueue = (e: KeyboardEvent) => {
       if (!isChatActive() || e.key !== "Enter" || e.shiftKey) return;
       const hasCtrl = e.ctrlKey || e.metaKey;
@@ -2286,6 +2310,9 @@ export default function ChatPage() {
       } catch {
         // ignore migration errors
       }
+      void migrateSdkInputQueue(agentId, tempId, realId).catch((error) => {
+        console.error("Failed to migrate SDK input queue:", error);
+      });
       lastSessionIdRef.current = realId;
       sessionApi.trackNavigatedSession(
         realId,
@@ -2325,6 +2352,7 @@ export default function ChatPage() {
       } catch {
         // ignore
       }
+      clearSdkInputQueue(agentId, removedId);
       stopBackgroundQueue(removedId);
       const removedScopeKey = sessionFilesScopeKey(
         selectedAgentRef.current,
@@ -2516,23 +2544,48 @@ export default function ChatPage() {
   );
 
   const customFetch = useCallback(
-    async (data: {
-      input?: Array<Record<string, unknown>>;
-      biz_params?: Record<string, unknown>;
-      signal?: AbortSignal;
-    }): Promise<Response> => {
+    async (
+      data: {
+        input?: Array<Record<string, unknown>>;
+        signal?: AbortSignal;
+      } & Partial<
+        Pick<
+          IAgentScopeRuntimeWebUIInputData,
+          | "session_id"
+          | "user_id"
+          | "channel"
+          | "agent_id"
+          | "context"
+          | "biz_params"
+        >
+      >,
+    ): Promise<Response> => {
       pendingFallbackEventsRef.current = [];
       pendingFallbackEventKeysRef.current.clear();
+      // Snapshot legacy state before the first await. SDK 1.2 supplies the
+      // immutable submission route in data for direct and queued sends.
+      const fallbackIdentity = sessionApi.getSessionIdentity();
+      const fallbackLocalChatId =
+        sessionApi.lastActiveChatId ?? chatIdRef.current;
+      const entrySnapshot = resolveChatRequestSnapshot(
+        data,
+        fallbackIdentity,
+        {},
+        selectedAgent,
+      );
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         ...buildAuthHeaders(),
       };
+      if (entrySnapshot.agentId) {
+        headers["X-Agent-Id"] = entrySnapshot.agentId;
+      }
 
       if (usesQwenPawBackend) {
         try {
           const activeModels = await providerApi.getActiveModels({
             scope: "effective",
-            agent_id: selectedAgent,
+            agent_id: entrySnapshot.agentId,
           });
           if (
             !activeModels?.active_llm?.provider_id ||
@@ -2553,7 +2606,7 @@ export default function ChatPage() {
       if (submittedValue !== null) {
         clearSubmittedSenderInput(submittedValue);
         pendingSenderClearRef.current = null;
-        localStorage.removeItem(getDraftStorageKey(selectedAgent));
+        localStorage.removeItem(getDraftStorageKey(entrySnapshot.agentId));
       }
 
       const { input = [], biz_params } = data;
@@ -2579,19 +2632,24 @@ export default function ChatPage() {
           ? [rewrittenLastMsg]
           : [];
 
-      const identity = sessionApi.getSessionIdentity();
+      const requestSnapshot = resolveChatRequestSnapshot(
+        data,
+        fallbackIdentity,
+        session,
+        selectedAgent,
+      );
       const usageTurn = useTurnUsageStore
         .getState()
-        .beginTurn(
-          selectedAgent,
-          identity.sessionId || session?.session_id || "",
-        );
+        .beginTurn(requestSnapshot.agentId, requestSnapshot.sessionId);
       let requestBody: Record<string, unknown> = {
         input: rewrittenInput,
-        session_id: identity.sessionId || session?.session_id || "",
-        user_id: identity.userId || session?.user_id || DEFAULT_USER_ID,
-        channel: identity.channel || session?.channel || DEFAULT_CHANNEL,
+        session_id: requestSnapshot.sessionId,
+        user_id: requestSnapshot.userId || DEFAULT_USER_ID,
+        channel: requestSnapshot.channel || DEFAULT_CHANNEL,
         stream: true,
+        ...(Object.keys(requestSnapshot.context).length > 0
+          ? { request_context: requestSnapshot.context }
+          : {}),
         ...biz_params,
       };
 
@@ -2601,7 +2659,7 @@ export default function ChatPage() {
         const next = entry.item.transform({
           payload: requestBody,
           sessionId: String(requestBody.session_id || ""),
-          selectedAgent,
+          selectedAgent: requestSnapshot.agentId,
         });
         if (next && typeof next === "object") {
           requestBody = next;
@@ -2632,12 +2690,10 @@ export default function ChatPage() {
           runningConfigApprovalLevel,
         );
         projectSessionId =
-          sessionApi.lastActiveChatId ??
-          chatIdRef.current ??
-          String(requestBody.session_id || "new");
+          fallbackLocalChatId ?? String(requestBody.session_id || "new");
         const pendingRequest = withPendingProjectDirectory(
           requestBody,
-          selectedAgent,
+          requestSnapshot.agentId,
           projectSessionId,
         );
         requestBody = pendingRequest.requestBody;
@@ -2698,10 +2754,14 @@ export default function ChatPage() {
         sessionApi.discardLastUserMessage(backendChatId, clientMessageId);
       }
 
-      const localIdToResolve = sessionApi.lastActiveChatId ?? chatIdRef.current;
+      const localIdToResolve = fallbackLocalChatId;
       if (response.ok && localIdToResolve) {
         if (appliedProjectDir && projectSessionId) {
-          setPendingProjectDirectory(selectedAgent, projectSessionId, null);
+          setPendingProjectDirectory(
+            requestSnapshot.agentId,
+            projectSessionId,
+            null,
+          );
         }
         sessionApi.triggerResolve(localIdToResolve);
       }
@@ -2792,6 +2852,34 @@ export default function ChatPage() {
     };
   }, []);
 
+  const sdkQueueOptions = useMemo(
+    () =>
+      createSdkInputQueueOptions({
+        agentId: selectedAgent,
+        getIdentity: () => sessionApi.getSessionIdentity(),
+        getBackendSessionId: (sessionId) =>
+          sessionApi.getBackendSessionId(sessionId),
+        getSessionRunning: async (sessionId, agentId) => {
+          const headers = buildAuthHeaders();
+          if (agentId) headers["X-Agent-Id"] = agentId;
+          const response = await fetch(
+            getApiUrl(`/chats/${encodeURIComponent(sessionId)}`),
+            { headers },
+          );
+          if (response.status === 404) return false;
+          if (!response.ok) {
+            throw new Error(`chat status request failed: ${response.status}`);
+          }
+          const chat = (await response.json()) as { status?: string };
+          return chat.status === "running";
+        },
+        onFull: (maxSize) =>
+          message.warning(t("chat.queue.queueFull", { max: maxSize })),
+        onSessionNotReady: () => message.warning(t("chat.queue.noChatWarning")),
+      }),
+    [message, selectedAgent, t],
+  );
+
   const options = useMemo(() => {
     const i18nConfig = getDefaultConfig(t);
     const hostCommands: CommandSuggestion[] = [
@@ -2857,13 +2945,15 @@ export default function ChatPage() {
         value: skill.name,
         description: "",
       }));
-    const handleBeforeSubmit = async () => {
+    const handleBeforeSubmit = async (
+      data: IAgentScopeRuntimeWebUIInputData,
+    ) => {
       if (isComposingRef.current) return false;
       // Single-tab ownership: non-owner tabs are queue-only. Re-route every
       // submit (Enter / send button / programmatic) to the shared queue and
       // abort the actual SDK send. The owner tab will pick the item up via
       // cross-tab broadcast and send it.
-      if (!isOwnerRef.current) {
+      if (!USE_SDK_INPUT_QUEUE && !isOwnerRef.current) {
         const textarea = getActiveSenderTextarea();
         const val = textarea?.value.trim() ?? "";
         if (!val) return false;
@@ -2905,18 +2995,23 @@ export default function ChatPage() {
       // Clear pending attachments when sending directly (not through queue)
       pendingFileListRef.current = [];
 
-      const textarea = getActiveSenderTextarea();
-      if (textarea) {
-        const prepared = usesQwenPawBackend
-          ? beginLoopModeSubmission(textarea.value)
-          : textarea.value;
-        if (prepared !== textarea.value) {
-          setTextareaValue(textarea, prepared);
-        }
-        pendingSenderClearRef.current = prepared;
-      }
+      const prepared = usesQwenPawBackend
+        ? beginLoopModeSubmission(data.query)
+        : data.query;
+      const identity = sessionApi.getSessionIdentity();
+      pendingSenderClearRef.current = prepared;
 
-      return true;
+      return {
+        proceed: true,
+        query: prepared,
+        session_id: identity.sessionId,
+        context: buildChatSubmissionContext(
+          data.context,
+          identity,
+          selectedAgent,
+        ),
+        biz_params: data.biz_params,
+      };
     };
 
     // ── Resolve plugin extension snapshots ────────────────────────────────
@@ -3162,6 +3257,7 @@ export default function ChatPage() {
       sender: {
         ...(i18nConfig as any)?.sender,
         beforeSubmit: handleBeforeSubmit,
+        queue: sdkQueueOptions,
         allowSpeech: whisperChecked && !whisperEnabled,
         beforeUI: showSenderBeforeUI ? (
           <>
@@ -3173,18 +3269,24 @@ export default function ChatPage() {
                 message={t("chat.queue.otherTabOwner")}
               />
             )}
-            <ChatSenderTabsPanel
-              bgSessionId={bgBackendSessionId}
-              queueSessionId={queueSessionId}
-              onRemove={handleQueueRemove}
-              onEdit={handleQueueEdit}
-              onReorder={handleQueueReorder}
-              onInterruptAndSend={handleQueueInterruptAndSend}
-              onClear={handleQueueClear}
-              onPauseResume={handleQueuePauseResume}
-              onRetry={handleQueueRetry}
-              onSkip={handleQueueSkip}
-            />
+            {USE_SDK_INPUT_QUEUE ? (
+              bgTaskCount > 0 ? (
+                <BackgroundTaskPanel sessionId={bgBackendSessionId} />
+              ) : null
+            ) : (
+              <ChatSenderTabsPanel
+                bgSessionId={bgBackendSessionId}
+                queueSessionId={queueSessionId}
+                onRemove={handleQueueRemove}
+                onEdit={handleQueueEdit}
+                onReorder={handleQueueReorder}
+                onInterruptAndSend={handleQueueInterruptAndSend}
+                onClear={handleQueueClear}
+                onPauseResume={handleQueuePauseResume}
+                onRetry={handleQueueRetry}
+                onSkip={handleQueueSkip}
+              />
+            )}
           </>
         ) : undefined,
         prefix: (
@@ -3404,14 +3506,15 @@ export default function ChatPage() {
           return toDisplayUrl(url);
         },
         onFileCardClick,
-        cancel(data: { session_id: string }) {
-          const resolvedChatId =
-            sessionApi.getRealIdForSession(data.session_id) ?? data.session_id;
-          if (resolvedChatId) {
-            chatApi.stopChat(resolvedChatId).catch((err) => {
-              console.error("Failed to stop chat:", err);
-            });
-          }
+        cancel(data: { session_id: string; abort?: () => void }) {
+          return cancelSdkChatRequest(data, {
+            resolveBackendSessionId: (sessionId) =>
+              sessionApi.getRealIdForSession(sessionId),
+            stopChat: (sessionId) => chatApi.stopChat(sessionId),
+            onError: (error) => {
+              console.error("Failed to stop chat:", error);
+            },
+          });
         },
         async reconnect(data: { session_id: string; signal?: AbortSignal }) {
           const headers: Record<string, string> = {
@@ -3521,6 +3624,7 @@ export default function ChatPage() {
     } as unknown as IAgentScopeRuntimeWebUIOptions;
   }, [
     customFetch,
+    sdkQueueOptions,
     copyResponse,
     handleFileUpload,
     t,

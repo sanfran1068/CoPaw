@@ -50,6 +50,7 @@ import type {
 } from "../../plugins/registry/types";
 import { DownloadableAudios } from "../../components/Chat/MediaDownload";
 import ResponseArtifactList from "../../features/files-workspace/ResponseArtifactList";
+import { isToolLikeResponseMessageType } from "./responseMessageTypes";
 
 function sortByOrder<T extends { item: { order?: number } }>(arr: T[]): T[] {
   return arr
@@ -163,17 +164,21 @@ const HostMessage = React.memo(function HostMessage({
 
 function DefaultHostResponseCard({
   data,
+  messageId,
   isLast,
   contentPrepend,
   contentAppend,
 }: {
   data: IAgentScopeRuntimeResponse;
+  messageId: string;
   isLast?: boolean;
   contentPrepend?: React.ReactNode;
   contentAppend?: React.ReactNode;
 }) {
   const avatar = useChatAnywhereOptions((options) => options.welcome?.avatar);
   const nick = useChatAnywhereOptions((options) => options.welcome?.nick);
+  const nickNode =
+    typeof nick === "string" || React.isValidElement(nick) ? nick : null;
   const messages = useMemo(
     () => AgentScopeRuntimeResponseBuilder.mergeToolMessages(data.output),
     [data.output],
@@ -191,21 +196,17 @@ function DefaultHostResponseCard({
       {avatar ? (
         <Flex align="center" gap={8} style={{ marginBottom: 8 }}>
           <Avatar src={avatar} />
-          {nick ? <span>{nick}</span> : null}
+          {nickNode ? <span>{nickNode}</span> : null}
         </Flex>
       ) : null}
       {contentPrepend}
       {messages.map((item) => {
+        if (isToolLikeResponseMessageType(item.type)) {
+          return <ResponseTool key={item.id} data={item} />;
+        }
         switch (item.type) {
           case AgentScopeRuntimeMessageType.MESSAGE:
             return <HostMessage key={item.id} data={item} />;
-          case AgentScopeRuntimeMessageType.PLUGIN_CALL:
-          case AgentScopeRuntimeMessageType.PLUGIN_CALL_OUTPUT:
-          case AgentScopeRuntimeMessageType.TOOL_CALL:
-          case AgentScopeRuntimeMessageType.TOOL_CALL_OUTPUT:
-          case AgentScopeRuntimeMessageType.MCP_CALL:
-          case AgentScopeRuntimeMessageType.MCP_CALL_OUTPUT:
-            return <ResponseTool key={item.id} data={item} />;
           case AgentScopeRuntimeMessageType.MCP_APPROVAL_REQUEST:
             return <ResponseTool key={item.id} data={item} isApproval />;
           case AgentScopeRuntimeMessageType.REASONING:
@@ -224,7 +225,7 @@ function DefaultHostResponseCard({
       {AgentScopeRuntimeResponseBuilder.maybeDone(data) ? (
         <ResponseArtifactList messages={messages} />
       ) : null}
-      <ResponseActions data={data} isLast={isLast} />
+      <ResponseActions data={data} messageId={messageId} isLast={isLast} />
     </>
   );
 }
@@ -298,6 +299,7 @@ export function HostRequestCard(props: { data: ChatRequestData }) {
 }
 
 function HostResponseCardContent(props: {
+  id: string;
   data: ChatResponseData;
   isLast?: boolean;
 }) {
@@ -345,6 +347,7 @@ function HostResponseCardContent(props: {
   const fallback = () => (
     <DefaultHostResponseCard
       data={props.data as unknown as IAgentScopeRuntimeResponse}
+      messageId={props.id}
       isLast={props.isLast}
       contentPrepend={contentPrepend}
       contentAppend={contentAppend}
@@ -372,6 +375,7 @@ function HostResponseCardContent(props: {
 const MemoizedHostResponseCard = React.memo(HostResponseCardContent);
 
 export function HostResponseCard(props: {
+  id: string;
   data: ChatResponseData;
   isLast?: boolean;
 }) {
