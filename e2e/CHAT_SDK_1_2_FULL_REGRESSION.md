@@ -4,7 +4,8 @@
 
 - 宿主：CoPaw / QwenPaw Console Chat
 - SDK：`@agentscope-ai/chat@1.2.0-beta.1787827278109`
-- 重点变更：会话级消息与 Loading 隔离、受控会话加载、异步取消协议、响应卡 `messageId`、函数/组件调用渲染、输入队列作用域与后台续传
+- 重点变更：会话级消息与 Loading 隔离、受控会话加载、异步取消协议、响应卡 `messageId`、函数/组件调用渲染和新版请求数据结构
+- 队列边界：不启用 AgentScopeRuntimeWebUI 延迟队列；继续使用 CoPaw 既有输入队列、后台发送和多标签页 ownership
 - 执行原则：自动化、真实浏览器、真实后端/模型三层证据分开记录；未执行项不得标记为通过
 
 ## 2. 通过标准
@@ -12,7 +13,7 @@
 1. P0 用例全部通过；P1 无阻断性失败。
 2. TypeScript、Chat 定向单测、Console 全量单测和生产构建全部通过。
 3. 页面无空白、无框架错误遮罩、无与本次升级相关的 console error。
-4. 请求的 `session_id`、`user_id`、`channel`、`agent_id` 在直接发送、排队、重试、跨 Agent/会话切换后均保持入队/提交时快照。
+4. 请求的 `session_id`、`user_id`、`channel`、`agent_id` 在直接发送及 CoPaw 既有队列的排队、重试、跨 Agent/会话切换后均保持入队/提交时快照。
 5. 停止生成同时满足：本地 SSE 立即停止、后端收到正确会话 ID、重复点击不重复污染状态。
 6. 多会话并行时，消息、Loading、重连和操作按钮均不串会话。
 
@@ -24,7 +25,7 @@
 | SDK-CON-002 | P0     | 校验 npm tarball SHA-1 / integrity | 与 registry 元数据一致                       | 安装     |
 | SDK-CON-003 | P0     | 安装后读取实际包版本               | `node_modules` 为目标版本，无旧版残留        | 安装     |
 | SDK-CON-004 | P0     | 运行 `tsc -b --noEmit`             | 0 类型错误                                   | 自动化   |
-| SDK-CON-005 | P0     | 运行 Chat 兼容性定向测试           | 请求快照、队列身份、取消、卡片契约全部通过   | 自动化   |
+| SDK-CON-005 | P0     | 运行 Chat 兼容性定向测试           | 请求快照、旧队列兼容、取消、卡片契约全部通过 | 自动化   |
 | SDK-CON-006 | P1     | 运行 Console 全量 Vitest           | 无新增失败；若有既有失败需单列               | 自动化   |
 | SDK-CON-007 | P0     | 运行生产构建                       | Vite、Monaco CSS、预压缩、首包检查均通过     | 构建     |
 | SDK-CON-008 | P1     | 检查 peer dependency / audit 输出  | 既有告警与本次新增风险分开记录，不做越界升级 | 静态     |
@@ -72,12 +73,14 @@
 | SDK-SES-006 | P0     | 快速连续点击 A/B/C             | 最后一次选择生效，旧请求结果被丢弃                | 自动化/浏览器 |
 | SDK-SES-007 | P0     | 刷新仍在生成的会话             | 通过 reconnect 恢复，已回放部分不重复动画         | 自动化/浏览器 |
 | SDK-SES-008 | P1     | 刷新已完成会话                 | 历史完整、时间与卡片状态正确                      | 浏览器        |
-| SDK-SES-009 | P0     | 新会话首条消息触发本地 ID→UUID | URL、消息、队列、项目目录一次迁移，无整页消息闪空 | 自动化/浏览器 |
+| SDK-SES-009 | P0     | 新会话首条消息触发本地 ID→UUID | URL、消息、CoPaw 队列、项目目录一次迁移，无整页消息闪空 | 自动化/浏览器 |
 | SDK-SES-010 | P0     | Agent A→B→A 切换               | 会话列表、草稿、身份、消息按 Agent 隔离           | 自动化/浏览器 |
 | SDK-SES-011 | P0     | 切换不同 user/channel 来源会话 | 请求沿用目标会话身份，不继承旧 window 全局值      | 自动化/API    |
 | SDK-SES-012 | P1     | 删除当前/非当前会话            | 列表、缓存、队列、审批级别与文件工作区同步清理    | 自动化/浏览器 |
 
-## 7. 输入队列、后台发送与多标签页
+## 7. CoPaw 既有输入队列、后台发送与多标签页
+
+> 本节验证宿主原有队列在 SDK 1.2 下没有回归，不代表接入 AgentScopeRuntimeWebUI 的 `sender.queue` 延迟队列。
 
 | ID          | 优先级 | 前置与步骤                      | 预期结果                                                    | 建议层级      |
 | ----------- | ------ | ------------------------------- | ----------------------------------------------------------- | ------------- |
@@ -135,7 +138,9 @@
 ## 10. 本分支执行状态
 
 - 自动化、浏览器、真实后端/模型三类证据分别记录；未执行项保持 Pending。
-- 本分支已接入 SDK 内置输入队列，旧 CoPaw 队列运行路径已关闭但代码暂留用于回滚审查。
-- 已通过：TypeScript、SDK 队列宿主适配定向测试（6 文件 / 137 用例）、Console 全量 Vitest（293 文件 / 2439 用例）、生产构建及 Monaco CSS/预压缩/首包门禁。
-- 已通过：隔离后端浏览器冒烟（聊天页和输入区正常渲染、无 console error）；Python E2E `MULTITAB-001`（运行中输入入队、两标签页状态同步、单 owner、关闭 owner 后接管）。
+- 本分支不启用 AgentScopeRuntimeWebUI 内置延迟队列，继续运行 CoPaw 既有输入队列；自动化必须断言 `sender.queue` 未配置。
+- 已通过：TypeScript、Chat/API 与 CoPaw 队列兼容定向测试（5 文件 / 97 用例）、Console 全量 Vitest（292 文件 / 2436 用例）。
+- 已通过：生产构建（18633 modules）、Monaco CSS、365 个静态资源预压缩及首包门禁（9.46 MiB raw / 2.40 MiB Brotli）。
+- 已通过：隔离后端 Chromium E2E `MULTITAB-001`，第二标签页显示 CoPaw 队列提示，持锁标签页不显示。
+- 待重新验证：隔离后端浏览器发送冒烟。
 - Pending：真实模型流式发送、Stop/重连、三条 FIFO、失败重试、附件队列、Agent/会话切换、Safari/WebKit 和全量 Python E2E。上述项目完成前，不能宣称使用场景已全覆盖。

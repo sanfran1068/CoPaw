@@ -65,8 +65,6 @@ vi.mock("./components/ChatSessionInitializer", () => ({
 }));
 
 vi.mock("@agentscope-ai/chat", () => ({
-  clearInputQueueState: vi.fn(),
-  migrateInputQueueState: vi.fn(() => Promise.resolve()),
   AgentScopeRuntimeWebUI: vi.fn((props: any) => {
     capturedOptions = props.options;
     return (
@@ -1026,19 +1024,15 @@ describe("ChatPage coverage", () => {
     }
   });
 
-  // ── SDK 1.2 queue and immutable submission snapshot ───────────────────
-  it("enables the SDK queue and snapshots direct-send identity", async () => {
+  // ── SDK 1.2 API and immutable submission snapshot ─────────────────────
+  it("keeps the SDK queue disabled and snapshots direct-send identity", async () => {
     renderWithProviders(<ChatPage />, {
       initialEntries: ["/chat/test-session"],
     });
     await screen.findByTestId("chat-ui");
 
     const beforeSubmit = capturedOptions?.sender?.beforeSubmit;
-    expect(capturedOptions?.sender?.queue).toMatchObject({
-      enable: true,
-      scope: "qwenpaw:default",
-      maxSize: 50,
-    });
+    expect(capturedOptions?.sender?.queue).toBeUndefined();
     expect(typeof beforeSubmit).toBe("function");
     const result = await beforeSubmit({
       query: "hello",

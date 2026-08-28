@@ -170,10 +170,14 @@ class ChatPage(BasePage):
         "older": ("Earlier", "更早"),
     }
 
-    # --- AgentScopeRuntimeWebUI 1.2 built-in input queue ---
-    QUEUE_PANEL = '.qwenpaw-chat-anywhere-input-queue'
-    QUEUE_ITEM = '.qwenpaw-chat-anywhere-input-queue-item'
-    QUEUE_REMOTE_OWNER = '.qwenpaw-chat-anywhere-input-queue-owner'
+    # --- Non-owner tab banner — upstream #5664 ---
+    # antd <Alert type="info" banner> injected into the sender beforeUI slot
+    # when this tab lost the qwenpaw:queue-owner:<sessionId> Web Lock. Appears
+    # only after a 300ms ownershipResolved fallback timer.
+    QUEUE_BANNER = '.qwenpaw-alert-banner'
+    _QUEUE_BANNER_RE = re.compile(
+        r"This tab queues only|当前标签页仅入队"
+    )
 
     # Action buttons
     COPY_BTN = 'span[title="复制"]'
@@ -1240,17 +1244,11 @@ class ChatPage(BasePage):
 
     # ========== Non-owner tab banner (upstream #5664) ==========
 
-    def get_queue_panel(self) -> Locator:
-        """AgentScopeRuntimeWebUI's built-in input queue panel."""
-        return self.page.locator(self.QUEUE_PANEL).first
-
-    def get_queue_items(self) -> Locator:
-        """Queued inputs rendered by the SDK panel."""
-        return self.page.locator(self.QUEUE_ITEM)
-
-    def get_queue_remote_owner(self) -> Locator:
-        """Marker rendered when another tab owns queue execution."""
-        return self.page.locator(self.QUEUE_REMOTE_OWNER).first
+    def get_queue_banner(self) -> Locator:
+        """The queue-only info banner in the sender area (non-owner tab)."""
+        return self.page.locator(self.QUEUE_BANNER).filter(
+            has_text=self._QUEUE_BANNER_RE
+        ).first
 
     # ========== Model and Agent switching ==========
     
