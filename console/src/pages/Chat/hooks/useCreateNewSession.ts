@@ -1,7 +1,6 @@
 import { useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useChatAnywhereSessions } from "@agentscope-ai/chat";
-import sessionApi from "../sessionApi";
 import { CHAT_BASE_PATH } from "../../../utils/sessionRoute";
 
 /**
@@ -17,7 +16,6 @@ export function useCreateNewSession(): () => Promise<void> {
   const { createSession } = useChatAnywhereSessions();
   return useCallback(async () => {
     navigate(CHAT_BASE_PATH, { replace: true });
-    sessionApi.userInitiatedCreate = true;
     await createSession();
   }, [navigate, createSession]);
 }
