@@ -360,13 +360,10 @@ describe("LocalModelManageModal", () => {
 
       renderModal();
 
-      await waitFor(() => {
-        expect(api.listRecommendedLocalModels).toHaveBeenCalled();
-      });
-
-      // the no-recommended-model hint (translation key) must be shown
+      // Wait for all initialization results to be reflected in the UI rather
+      // than merely waiting for the recommendation request to start.
       expect(
-        screen.getByText("models.localNoRecommendedModels"),
+        await screen.findByText("models.localNoRecommendedModels"),
       ).toBeInTheDocument();
     });
 
@@ -381,13 +378,10 @@ describe("LocalModelManageModal", () => {
 
       renderModal();
 
-      await waitFor(() => {
-        expect(api.listRecommendedLocalModels).toHaveBeenCalled();
-      });
-
-      // the no-downloaded-model hint (translation key) must be shown
+      // Wait for the resolved runtime status and model list to be reflected in
+      // the UI, rather than merely waiting for the requests to start.
       expect(
-        screen.getByText("models.localNoDownloadedModelsHint"),
+        await screen.findByText("models.localNoDownloadedModelsHint"),
       ).toBeInTheDocument();
     });
   });
@@ -406,7 +400,7 @@ describe("LocalModelManageModal", () => {
       ).toBeInTheDocument();
 
       // the input must be shown
-      const input = screen.getByPlaceholderText(
+      const input = await screen.findByPlaceholderText(
         "models.localRepoIdPlaceholder",
       );
       expect(input).toBeInTheDocument();
@@ -425,7 +419,7 @@ describe("LocalModelManageModal", () => {
       });
 
       // type the repo ID
-      const input = screen.getByPlaceholderText(
+      const input = await screen.findByPlaceholderText(
         "models.localRepoIdPlaceholder",
       );
       await user.type(input, "custom/model");
@@ -474,7 +468,7 @@ describe("LocalModelManageModal", () => {
       });
 
       // type the repo ID
-      const input = screen.getByPlaceholderText(
+      const input = await screen.findByPlaceholderText(
         "models.localRepoIdPlaceholder",
       );
       await user.type(input, "custom/model");
